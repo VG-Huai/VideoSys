@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -644,7 +645,7 @@ class CogVideoXPipeline(VideoSysPipeline):
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
 
-        # 4. Prepare timesteps
+        # 4. Prepare timesteps, default uniform timesteps, total 50 steps
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
         self._num_timesteps = len(timesteps)
 
@@ -688,6 +689,16 @@ class CogVideoXPipeline(VideoSysPipeline):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
+                mask = self.compute_similarity_mask(latent_model_input, threshold=0.85)
+                # mask = self.batched_find_idxs_to_keep(latent_model_input, threshold=1, tubelet_size=1, patch_size=1)
+                # mask = self.batched_find_idxs_to_keep(x, threshold=0.3, tubelet_size=1, patch_size=1)
+                print('------------------')
+                total_tokens = mask.numel()
+                filtered_tokens = (mask == 0).sum().item()
+                filtered_percentage = 100.0 * filtered_tokens / total_tokens
+                print('time step:', t)
+                print(f"Mask Filtering: {filtered_percentage:.2f}% tokens filtered")
+                
                 # predict noise model_output
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
@@ -753,7 +764,85 @@ class CogVideoXPipeline(VideoSysPipeline):
     def save_video(self, video, output_path):
         save_video(video, output_path, fps=8)
 
+    def batched_find_idxs_to_keep(self, 
+                                x: torch.Tensor, 
+                              threshold: int=2, 
+                              tubelet_size: int=2,
+                              patch_size: int=16) -> torch.Tensor:
+        """
+        Find the static tokens in a video tensor, and return a mask
+        that selects tokens that are not repeated.
 
+        Args:
+        - x (torch.Tensor): A tensor of shape [B, C, T, H, W].
+        - threshold (int): The mean intensity threshold for considering
+                a token as static.
+        - tubelet_size (int): The temporal length of a token.
+        Returns:
+        - mask (torch.Tensor): A bool tensor of shape [B, T, H, W] 
+            that selects tokens that are not repeated.
+
+        """
+        # Ensure input has the format [B, C, T, H, W]
+        assert len(x.shape) == 5, "Input must be a 5D tensor"
+        #ipdb.set_trace()
+        # Convert to float32 if not already
+        x = x.type(torch.float32)
+        
+        # Calculate differences between frames with a step of tubelet_size, ensuring batch dimension is preserved
+        # Compare "front" of first token to "back" of second token
+        diffs = x[:, :, (2*tubelet_size-1)::tubelet_size] - x[:, :, :-tubelet_size:tubelet_size]
+        # Ensure nwe track negative movement.
+        diffs = torch.abs(diffs)
+        
+        # Apply average pooling over spatial dimensions while keeping the batch dimension intact
+        avg_pool_blocks = F.avg_pool3d(diffs, (1, patch_size, patch_size))
+        # Compute the mean along the channel dimension, preserving the batch dimension
+        avg_pool_blocks = torch.mean(avg_pool_blocks, dim=1, keepdim=True)
+        # Create a dummy first frame for each item in the batch
+        first_frame = torch.ones_like(avg_pool_blocks[:, :, 0:1]) * 255
+        # first_frame = torch.zeros_like(avg_pool_blocks[:, :, 0:1])
+        # Concatenate the dummy first frame with the rest of the frames, preserving the batch dimension
+        avg_pool_blocks = torch.cat([first_frame, avg_pool_blocks], dim=2)
+        # Determine indices to keep based on the threshold, ensuring the operation is applied across the batch
+        # Update mask: 0 for high similarity, 1 for low similarity
+        keep_idxs = avg_pool_blocks.squeeze(1) > threshold  
+        keep_idxs = keep_idxs.unsqueeze(1)
+        keep_idxs = keep_idxs.float()
+        # Flatten out everything but the batch dimension
+        # keep_idxs = keep_idxs.flatten(1)
+        #ipdb.set_trace()
+        return keep_idxs
+    def compute_similarity_mask(self, latent, threshold=0.95):
+        """
+        Compute frame-wise similarity for latent and generate mask.
+
+        Args:
+        - latent (torch.Tensor): Latent tensor of shape [n, c, t, h, w].
+        - threshold (float): Similarity threshold to determine whether to skip computation.
+
+        Returns:
+        - mask (torch.Tensor): Mask tensor of shape [n, 1, t, h, w],
+        where mask = 0 means skip computation, mask = 1 means recompute.
+        """
+        n, c, t, h, w = latent.shape
+        mask = torch.ones((n, 1, t, h, w), device=latent.device)  # Initialize mask with all 1s
+
+        for frame_idx in range(1, t):  # Start from the second frame
+            curr_frame = latent[:, :, frame_idx, :, :]  # Current frame [n, c, h, w]
+            prev_frame = latent[:, :, frame_idx - 1, :, :]  # Previous frame [n, c, h, w]
+
+            # Compute token-wise cosine similarity
+            dot_product = (curr_frame * prev_frame).sum(dim=1, keepdim=True)  # [n, 1, h, w]
+            norm_curr = curr_frame.norm(dim=1, keepdim=True)
+            norm_prev = prev_frame.norm(dim=1, keepdim=True)
+            similarity = dot_product / (norm_curr * norm_prev + 1e-8)  # Avoid division by zero
+
+            # Update mask: 0 for high similarity, 1 for low similarity
+            mask[:, :, frame_idx, :, :] = (similarity <= threshold).float()
+        # mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        return mask
+    
 # Similar to diffusers.pipelines.hunyuandit.pipeline_hunyuandit.get_resize_crop_region_for_grid
 def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
     tw = tgt_width

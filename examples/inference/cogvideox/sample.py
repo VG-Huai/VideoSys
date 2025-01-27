@@ -7,7 +7,8 @@ def run_base():
     config = CogVideoXConfig("THUDM/CogVideoX-2b", num_gpus=1)
     engine = VideoSysEngine(config)
 
-    prompt = "Sunset over the sea."
+    # prompt = "Sunset over the sea."
+    prompt = "2 Dog and a whale, ocean adventure"
     # num frames should be <= 49. resolution is fixed to 720p.
     # seed=-1 means random seed. >0 means fixed seed.
     video = engine.generate(
@@ -33,7 +34,8 @@ def run_low_mem():
     config = CogVideoXConfig("THUDM/CogVideoX-2b", cpu_offload=True, vae_tiling=True)
     engine = VideoSysEngine(config)
 
-    prompt = "Sunset over the sea."
+    # prompt = "Sunset over the sea."
+    prompt = "2 Dog and a whale, ocean adventure"
     video = engine.generate(prompt).video[0]
     engine.save_video(video, f"./outputs/{prompt}.mp4")
 

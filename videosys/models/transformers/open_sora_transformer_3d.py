@@ -640,6 +640,163 @@ class STDiT3(PreTrainedModel):
         x = x.to(torch.float32)
 
         return x
+    def eff_forward(
+        self, x, timestep, y, all_timesteps=None, mask=None, x_mask=None, fps=None, height=None, width=None, **kwargs
+    ):
+        _, _, Tx, Hx, Wx = x.size()
+        T, H, W = self.get_dynamic_size(x)
+        # keep_idxs = self.compute_similarity_mask(x, threshold=0.95)
+        # keep_idxs = None
+        keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.5, tubelet_size=1, patch_size=1)
+        # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.3, tubelet_size=1, patch_size=1)
+        print('------------------')
+        total_tokens = keep_idxs.numel()
+        filtered_tokens = (keep_idxs == 0).sum().item()
+        filtered_percentage = 100.0 * filtered_tokens / total_tokens
+        print('timestep:', timestep)
+        print(f"Mask Filtering: {filtered_percentage:.2f}% tokens filtered")
+        # === Split batch ===
+        if self.parallel_manager.cp_size > 1:
+            assert not self.training, "Batch split is not supported in training"
+            set_pad("batch", x.shape[0], self.parallel_manager.cp_group)
+            x, timestep, y, x_mask, fps = batch_func(
+                partial(split_sequence, process_group=self.parallel_manager.cp_group, dim=0, pad=get_pad("batch")),
+                x,
+                timestep,
+                y,
+                x_mask,
+                fps,
+            )
+            mask = split_sequence(mask, self.parallel_manager.cp_group, dim=0, pad=get_pad("batch"), pad_val=1)
+
+        dtype = self.x_embedder.proj.weight.dtype
+        B = x.size(0)
+        x = x.to(dtype)
+        timestep = timestep.to(dtype)
+        y = y.to(dtype)
+
+        # === get pos embed ===
+        S = H * W
+        base_size = round(S**0.5)
+        resolution_sq = (height[0].item() * width[0].item()) ** 0.5
+        scale = resolution_sq / self.input_sq_size
+        pos_emb = self.pos_embed(x, H, W, scale=scale, base_size=base_size)
+
+        # === get timestep embed ===
+        t = self.t_embedder(timestep, dtype=x.dtype)  # [B, C]
+        fps = self.fps_embedder(fps.unsqueeze(1), B)
+        t = t + fps
+        t_mlp = self.t_block(t)
+        t0 = t0_mlp = None
+        if x_mask is not None:
+            t0_timestep = torch.zeros_like(timestep)
+            t0 = self.t_embedder(t0_timestep, dtype=x.dtype)
+            t0 = t0 + fps
+            t0_mlp = self.t_block(t0)
+
+        # === get y embed ===
+        if self.config.skip_y_embedder:
+            y_lens = mask
+            if isinstance(y_lens, torch.Tensor):
+                y_lens = y_lens.long().tolist()
+        else:
+            y, y_lens = self.encode_text(y, mask)
+
+        # === get x embed ===
+        x = self.x_embedder(x)  # [B, N, C]
+        x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
+        x = x + pos_emb
+
+        # shard over the sequence dim if sp is enabled
+        if self.parallel_manager.sp_size > 1:
+            set_pad("temporal", T, self.parallel_manager.sp_group)
+            set_pad("spatial", S, self.parallel_manager.sp_group)
+            set_pad("batch", x.shape[0], self.parallel_manager.sp_group)
+            x = split_sequence(x, self.parallel_manager.sp_group, dim=2, grad_scale="down", pad=get_pad("spatial"))
+            T, S = x.shape[1], x.shape[2]
+
+        x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
+
+        # === blocks ===
+        valid_depth = kwargs.get("valid_depth", self.depth)
+        for depth in range(valid_depth):
+            spatial_block = self.spatial_blocks[depth]
+            temporal_block = self.temporal_blocks[depth]
+            x = auto_recompute(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S, timestep)
+            x = auto_recompute(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S, timestep)
+
+        if self.parallel_manager.sp_size > 1:
+            x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
+            x = gather_sequence(x, self.parallel_manager.sp_group, dim=2, grad_scale="up", pad=get_pad("spatial"))
+            T, S = x.shape[1], x.shape[2]
+            x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
+
+        # === final layer ===
+        x = self.final_layer(x, t, x_mask, t0, T, S)
+        x = self.unpatchify(x, T, H, W, Tx, Hx, Wx)
+
+        # === Gather Output ===
+        if self.parallel_manager.cp_size > 1:
+            x = gather_sequence(x, self.parallel_manager.cp_group, dim=0, pad=get_pad("batch"))
+
+        # cast to float32 for better accuracy
+        x = x.to(torch.float32)
+
+        return x
+    
+    def compute_mask_dict_spatial(self, mask_dict, cur_h, cur_w):
+        mask = mask_dict[(cur_h, cur_w)]['mask']
+        indices = []
+        _mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
+        _mask = rearrange(_mask, 'b 1 t h w -> (b t) (h w)')
+        # for i in range(_mask.size(0)):
+        #     index_per_batch = torch.where(_mask[i].bool())[0]
+        #     indices.append(index_per_batch)
+        mask_dict[(cur_h, cur_w)]['spatial']['indices'] = indices
+        mask_dict[(cur_h, cur_w)]['spatial']['indices1'] = indices1
+        mask_bool = _mask.bool()
+        mask_bool = mask_bool.T
+        device = mask.device
+        batch_size, seq_len = mask_bool.shape
+        # print('------------------')
+        time_stamp = time.time()
+        arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        # print('time for arange_indices:', time.time()-time_stamp)
+        time_stamp = time.time()
+        nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
+        valid_indices = torch.zeros_like(arange_indices)
+        valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
+        cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
+        # print('time for cumsum_mask:', time.time()-time_stamp)
+        time_stamp = time.time()
+        nearest_indices = torch.clip(cumsum_mask - 1, min=0)
+        # print('time for nearest_indices:', time.time()-time_stamp)
+        time_stamp = time.time()
+        actual_indices = valid_indices.gather(1, nearest_indices)
+        mask_dict[(cur_h, cur_w)]['spatial']['actual_indices'] = actual_indices
+        return mask_dict
+        
+    def compute_mask_dict_temporal(self, mask_dict, cur_h, cur_w):
+        mask = mask_dict[(cur_h, cur_w)]['mask']
+        indices = []
+        _mask = torch.round(mask).to(torch.int)
+        _mask = rearrange(_mask, 'b 1 t h w -> (b h w) (t)')
+        indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
+        mask_dict[(cur_h, cur_w)]['temporal']['indices'] = indices
+        mask_dict[(cur_h, cur_w)]['temporal']['indices1'] = indices1
+        mask_bool = _mask.bool()
+        device = mask.device
+        batch_size, seq_len = mask_bool.shape
+        arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
+        valid_indices = torch.zeros_like(arange_indices)
+        valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
+        cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
+        nearest_indices = torch.clip(cumsum_mask - 1, min=0)
+        actual_indices = valid_indices.gather(1, nearest_indices)
+        mask_dict[(cur_h, cur_w)]['temporal']['actual_indices'] = actual_indices
+        return mask_dict
 
     def unpatchify(self, x, N_t, N_h, N_w, R_t, R_h, R_w):
         """
@@ -746,6 +903,39 @@ class STDiT3(PreTrainedModel):
             mask[:, :, frame_idx, :, :] = (similarity <= threshold).float()
         # mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
         return mask
+    
+    def resize_mask(self, mask, target_h, target_w):
+        """
+        Resize the mask to match the new spatial dimensions of x.
+
+        Args:
+        - mask (torch.Tensor): Input mask of shape [b, 1, t, h, w].
+        - target_h (int): Target height.
+        - target_w (int): Target width.
+
+        Returns:
+        - resized_mask (torch.Tensor): Resized mask of shape [b, 1, t, target_h, target_w].
+        """
+        if mask is None:
+            return mask
+        batch, _, t, h, w = mask.shape
+
+        if h == target_h and w == target_w:
+            return mask  # No resizing needed
+
+        # Reshape to [b * t, 1, h, w]
+        mask = mask.view(batch * t, 1, h, w)
+
+        # Resize to [b * t, 1, target_h, target_w]
+        resized_mask = F.interpolate(mask, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        # Ensure the mask is binary (0 or 1)
+        resized_mask = (resized_mask > 0.5).float()
+
+        # Reshape back to [b, 1, t, target_h, target_w]
+        resized_mask = resized_mask.view(batch, 1, t, target_h, target_w)
+
+        return resized_mask
     
 
 

@@ -12,6 +12,8 @@ from diffusers.models.attention_processor import AttnProcessor
 from einops import rearrange
 from torch.amp import autocast
 
+import xformers
+
 from videosys.core.distributed.comm import all_to_all_with_pad, get_pad, set_pad
 from videosys.core.pab.pab_mgr import enable_pab, if_broadcast_cross, if_broadcast_spatial, if_broadcast_temporal
 from videosys.models.modules.normalization import VchitectSpatialNorm, get_rms_norm
@@ -94,10 +96,21 @@ class OpenSoraAttention(nn.Module):
                 )
             elif not use_flash_attn:
                 # print(f"rank: {torch.distributed.get_rank()} Using torch attn with B={B}, N={N}")
-                x = self.native_attention(q, k, v)
+                # x = self.native_attention(q, k, v)
+                x = x = F.scaled_dot_product_attention(q, k, v)
                 # x = checkpoint(self.native_attention, q, k, v, use_reentrant=False)
             else:
-                x = F.scaled_dot_product_attention(q, k, v)
+                # F.scaled_dot_product_attention need BHMK input shape,
+                # But memory_efficient_attention need BMHK input shape, so we need to transpose the input
+                # x = F.scaled_dot_product_attention(q, k, v)
+                q = q.permute(0, 2, 1, 3)
+                k = k.permute(0, 2, 1, 3)
+                v = v.permute(0, 2, 1, 3)
+                dtype = q.dtype
+                x = xformers.ops.memory_efficient_attention(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), attn_bias=None)
+                x = x.to(dtype)
+                x = x.permute(0, 2, 1, 3)
+                
 
         x_output_shape = (B, N, C)
         if not (self.enable_flash_attn and use_flash_attn):
@@ -108,11 +121,22 @@ class OpenSoraAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-    def native_attention(self, q, k, v):
+    def native_attention_org(self, q, k, v):
         dtype = q.dtype
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)  # translate attn to float32
         attn = attn.to(torch.float32)
+        attn = attn.softmax(dim=-1)
+        attn = attn.to(dtype)  # cast back attn to original dtype
+        attn = self.attn_drop(attn)
+        x = attn @ v
+        return x
+    
+    def native_attention(self, q, k, v):
+        dtype = q.dtype
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)  # translate attn to float32
+        # attn = attn.to(torch.float32)
         attn = attn.softmax(dim=-1)
         attn = attn.to(dtype)  # cast back attn to original dtype
         attn = self.attn_drop(attn)

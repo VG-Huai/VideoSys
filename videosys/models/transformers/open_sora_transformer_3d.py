@@ -544,7 +544,8 @@ class STDiT3(PreTrainedModel):
         T, H, W = self.get_dynamic_size(x)
         # keep_idxs = self.compute_similarity_mask(x, threshold=0.95)
         # keep_idxs = None
-        keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.5, tubelet_size=1, patch_size=1)
+        # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.5, tubelet_size=1, patch_size=1)
+        keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.7, tubelet_size=1, patch_size=2)
         # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.3, tubelet_size=1, patch_size=1)
         print('------------------')
         total_tokens = keep_idxs.numel()
@@ -640,7 +641,8 @@ class STDiT3(PreTrainedModel):
         x = x.to(torch.float32)
 
         return x
-    def eff_forward(
+    
+    def org_forward(
         self, x, timestep, y, all_timesteps=None, mask=None, x_mask=None, fps=None, height=None, width=None, **kwargs
     ):
         _, _, Tx, Hx, Wx = x.size()

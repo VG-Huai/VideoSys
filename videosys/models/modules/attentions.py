@@ -97,7 +97,14 @@ class OpenSoraAttention(nn.Module):
             elif not use_flash_attn:
                 # print(f"rank: {torch.distributed.get_rank()} Using torch attn with B={B}, N={N}")
                 # x = self.native_attention(q, k, v)
-                x = x = F.scaled_dot_product_attention(q, k, v)
+                # x = x = F.scaled_dot_product_attention(q, k, v)
+                q = q.permute(0, 2, 1, 3)
+                k = k.permute(0, 2, 1, 3)
+                v = v.permute(0, 2, 1, 3)
+                dtype = q.dtype
+                x = xformers.ops.memory_efficient_attention(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), attn_bias=None)
+                x = x.to(dtype)
+                x = x.permute(0, 2, 1, 3)
                 # x = checkpoint(self.native_attention, q, k, v, use_reentrant=False)
             else:
                 # F.scaled_dot_product_attention need BHMK input shape,
@@ -281,16 +288,21 @@ class OpenSoraMultiHeadCrossAttention(nn.Module):
         return x
 
     def torch_impl(self, q, k, v, mask, B, N, C):
-        q = q.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # q = q.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # k = k.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # v = v.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(B, -1, self.num_heads, self.head_dim)
+        k = k.view(B, -1, self.num_heads, self.head_dim)
+        v = v.view(B, -1, self.num_heads, self.head_dim)
+        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None)
+        # out = out.transpose(1, 2)
+        x = out.contiguous().view(B, N, C)
+        # attn_mask = torch.zeros(B, 1, N, k.shape[2], dtype=torch.bool, device=q.device)
+        # for i, m in enumerate(mask):
+        #     attn_mask[i, :, :, :m] = -1e9
 
-        attn_mask = torch.zeros(B, 1, N, k.shape[2], dtype=torch.bool, device=q.device)
-        for i, m in enumerate(mask):
-            attn_mask[i, :, :, :m] = -1e9
-
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        x = out.transpose(1, 2).contiguous().view(B, N, C)
+        # out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        # x = out.transpose(1, 2).contiguous().view(B, N, C)
         return x
 
 

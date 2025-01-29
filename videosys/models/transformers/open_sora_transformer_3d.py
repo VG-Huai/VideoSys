@@ -43,6 +43,7 @@ from videosys.models.modules.embeddings import (
     TimestepEmbedder,
 )
 from videosys.utils.utils import batch_func
+from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 
 
 def t2i_modulate(x, shift, scale):
@@ -553,6 +554,18 @@ class STDiT3(PreTrainedModel):
         filtered_percentage = 100.0 * filtered_tokens / total_tokens
         print('timestep:', timestep)
         print(f"Mask Filtering: {filtered_percentage:.2f}% tokens filtered")
+        
+        attn_bias_dict = {}
+        attn_bias_dict['spatial'] = self.create_block_diagonal_attention_mask(keep_idxs, H * W)
+        attn_bias_dict['temporal'] = self.create_block_diagonal_attention_mask(keep_idxs, T)
+        
+        mask_dict = {}
+        mask_dict['mask'] = keep_idxs
+        mask_dict['spatial'] = {}
+        mask_dict['temporal'] = {}
+        mask_dict = self.compute_mask_dict_spatial(mask_dict, H, W)
+        mask_dict = self.compute_mask_dict_temporal(mask_dict, H, W)
+        
         # === Split batch ===
         if self.parallel_manager.cp_size > 1:
             assert not self.training, "Batch split is not supported in training"
@@ -747,7 +760,7 @@ class STDiT3(PreTrainedModel):
         return x
     
     def compute_mask_dict_spatial(self, mask_dict, cur_h, cur_w):
-        mask = mask_dict[(cur_h, cur_w)]['mask']
+        mask = mask_dict['mask']
         indices = []
         _mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
         indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
@@ -755,38 +768,38 @@ class STDiT3(PreTrainedModel):
         # for i in range(_mask.size(0)):
         #     index_per_batch = torch.where(_mask[i].bool())[0]
         #     indices.append(index_per_batch)
-        mask_dict[(cur_h, cur_w)]['spatial']['indices'] = indices
-        mask_dict[(cur_h, cur_w)]['spatial']['indices1'] = indices1
+        mask_dict['spatial']['indices'] = indices
+        mask_dict['spatial']['indices1'] = indices1
         mask_bool = _mask.bool()
         mask_bool = mask_bool.T
         device = mask.device
         batch_size, seq_len = mask_bool.shape
         # print('------------------')
-        time_stamp = time.time()
+        # time_stamp = time.time()
         arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
         # print('time for arange_indices:', time.time()-time_stamp)
-        time_stamp = time.time()
+        # time_stamp = time.time()
         nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
         valid_indices = torch.zeros_like(arange_indices)
         valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
         cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
         # print('time for cumsum_mask:', time.time()-time_stamp)
-        time_stamp = time.time()
+        # time_stamp = time.time()
         nearest_indices = torch.clip(cumsum_mask - 1, min=0)
         # print('time for nearest_indices:', time.time()-time_stamp)
-        time_stamp = time.time()
+        # time_stamp = time.time()
         actual_indices = valid_indices.gather(1, nearest_indices)
-        mask_dict[(cur_h, cur_w)]['spatial']['actual_indices'] = actual_indices
+        mask_dict['spatial']['actual_indices'] = actual_indices
         return mask_dict
         
     def compute_mask_dict_temporal(self, mask_dict, cur_h, cur_w):
-        mask = mask_dict[(cur_h, cur_w)]['mask']
+        mask = mask_dict['mask']
         indices = []
         _mask = torch.round(mask).to(torch.int)
         _mask = rearrange(_mask, 'b 1 t h w -> (b h w) (t)')
         indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
-        mask_dict[(cur_h, cur_w)]['temporal']['indices'] = indices
-        mask_dict[(cur_h, cur_w)]['temporal']['indices1'] = indices1
+        mask_dict['temporal']['indices'] = indices
+        mask_dict['temporal']['indices1'] = indices1
         mask_bool = _mask.bool()
         device = mask.device
         batch_size, seq_len = mask_bool.shape
@@ -797,8 +810,41 @@ class STDiT3(PreTrainedModel):
         cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
         nearest_indices = torch.clip(cumsum_mask - 1, min=0)
         actual_indices = valid_indices.gather(1, nearest_indices)
-        mask_dict[(cur_h, cur_w)]['temporal']['actual_indices'] = actual_indices
+        mask_dict['temporal']['actual_indices'] = actual_indices
         return mask_dict
+
+    
+    def create_block_diagonal_attention_mask(self, mask, kv_seqlen, mode='spatial'):
+        """
+        将 mask 和 kv_seqlen 转换为 BlockDiagonalMask, 用于高效的注意力计算。
+        
+        Args:
+            mask (torch.Tensor): 输入的掩码，标记哪些 token 应该被忽略。
+            kv_seqlen (torch.Tensor): 键/值的序列长度。
+            heads (int): 注意力头的数量。
+
+        Returns:
+            BlockDiagonalPaddedKeysMask: 转换后的注意力掩码，用于高效的计算。
+        """
+        # 计算 q_seqlen: 通过 mask 来提取有效的查询 token 数量
+        mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        if mode == 'spatial':
+            mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)')
+        else:
+            mask = rearrange(mask, 'b 1 t h w -> (b h w) (t)')
+        
+        q_seqlen = mask.sum(dim=-1)  # 计算每个批次中有效的查询 token 数量
+        q_seqlen = q_seqlen.tolist()
+        
+        kv_seqlen = [kv_seqlen] * len(q_seqlen)  # 重复 kv_seqlen 次
+
+        # 生成 BlockDiagonalPaddedKeysMask
+        attn_bias = BlockDiagonalMask.from_seqlens(
+            q_seqlen,  
+            kv_seqlen=kv_seqlen,  # 键/值的序列长度
+        )
+        
+        return attn_bias, q_seqlen, kv_seqlen
 
     def unpatchify(self, x, N_t, N_h, N_w, R_t, R_h, R_w):
         """

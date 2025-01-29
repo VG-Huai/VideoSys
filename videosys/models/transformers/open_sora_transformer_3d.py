@@ -555,17 +555,6 @@ class STDiT3(PreTrainedModel):
         print('timestep:', timestep)
         print(f"Mask Filtering: {filtered_percentage:.2f}% tokens filtered")
         
-        attn_bias_dict = {}
-        attn_bias_dict['spatial'] = self.create_block_diagonal_attention_mask(keep_idxs, H * W)
-        attn_bias_dict['temporal'] = self.create_block_diagonal_attention_mask(keep_idxs, T)
-        
-        mask_dict = {}
-        mask_dict['mask'] = keep_idxs
-        mask_dict['spatial'] = {}
-        mask_dict['temporal'] = {}
-        mask_dict = self.compute_mask_dict_spatial(mask_dict, H, W)
-        mask_dict = self.compute_mask_dict_temporal(mask_dict, H, W)
-        
         # === Split batch ===
         if self.parallel_manager.cp_size > 1:
             assert not self.training, "Batch split is not supported in training"
@@ -613,6 +602,21 @@ class STDiT3(PreTrainedModel):
         else:
             y, y_lens = self.encode_text(y, mask)
 
+        attn_bias_dict = {}
+        attn_bias_dict['self'] = {}
+        attn_bias_dict['cross'] = {}
+        attn_bias_dict['self']['spatial'] = self.create_block_diagonal_attention_mask(keep_idxs, H * W)
+        attn_bias_dict['self']['temporal'] = self.create_block_diagonal_attention_mask(keep_idxs, T)
+        attn_bias_dict['cross']['spatial'] = self.create_block_diagonal_attention_mask(keep_idxs, y_lens[0])
+        attn_bias_dict['cross']['temporal'] = self.create_block_diagonal_attention_mask(keep_idxs, y_lens[0])
+        
+        mask_dict = {}
+        mask_dict['mask'] = keep_idxs
+        mask_dict['spatial'] = {}
+        mask_dict['temporal'] = {}
+        mask_dict = self.compute_mask_dict_spatial(mask_dict, H, W)
+        mask_dict = self.compute_mask_dict_temporal(mask_dict, H, W)
+        
         # === get x embed ===
         x = self.x_embedder(x)  # [B, N, C]
         x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)

@@ -172,6 +172,8 @@ class STDiT3Block(nn.Module):
         T=None,  # number of frames
         S=None,  # number of pixel patches
         timestep=None,
+        mask_dict = None,
+        attn_bias_dict = None,
         all_timesteps=None,
     ):
         # prepare modulate parameters
@@ -204,7 +206,7 @@ class STDiT3Block(nn.Module):
             # attention
             if self.temporal:
                 x_m = rearrange(x_m, "B (T S) C -> (B S) T C", T=T, S=S)
-                x_m = self.attn(x_m)
+                x_m = self.attn(x_m, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict, mode='temporal')
                 x_m = rearrange(x_m, "(B S) T C -> B (T S) C", T=T, S=S)
             else:
                 if self.parallel_manager.sp_size > 1:
@@ -212,7 +214,7 @@ class STDiT3Block(nn.Module):
                     x_m, S, T = self.dynamic_switch(x_m, S, T, to_spatial_shard=False, is_image=is_image)
 
                 x_m = rearrange(x_m, "B (T S) C -> (B T) S C", T=T, S=S)
-                x_m = self.attn(x_m)
+                x_m = self.attn(x_m, mask_dict=mask_dict, attn_bias_dict=attn_bias_dict, mode='spatial')
                 x_m = rearrange(x_m, "(B T) S C -> B (T S) C", T=T, S=S)
                 if self.parallel_manager.sp_size > 1:
                     x_m, S, T = self.dynamic_switch(x_m, S, T, to_spatial_shard=True, is_image=is_image)
@@ -236,7 +238,7 @@ class STDiT3Block(nn.Module):
         if enable_pab() and broadcast_cross:
             x = x + self.last_cross
         else:
-            x_cross = self.cross_attn(x, y, mask)
+            x_cross = self.cross_attn(x, y, mask, mask_dict, attn_bias_dict)
             if enable_pab():
                 self.last_cross = x_cross
             x = x + x_cross
@@ -546,8 +548,8 @@ class STDiT3(PreTrainedModel):
         # keep_idxs = self.compute_similarity_mask(x, threshold=0.95)
         # keep_idxs = None
         # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.5, tubelet_size=1, patch_size=1)
-        keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.7, tubelet_size=1, patch_size=2)
-        # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.3, tubelet_size=1, patch_size=1)
+        # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.7, tubelet_size=1, patch_size=2)
+        keep_idxs = self.batched_find_idxs_to_keep(x, threshold=2, tubelet_size=1, patch_size=2)
         print('------------------')
         total_tokens = keep_idxs.numel()
         filtered_tokens = (keep_idxs == 0).sum().item()
@@ -637,8 +639,8 @@ class STDiT3(PreTrainedModel):
         for depth in range(valid_depth):
             spatial_block = self.spatial_blocks[depth]
             temporal_block = self.temporal_blocks[depth]
-            x = auto_recompute(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S, timestep)
-            x = auto_recompute(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S, timestep)
+            x = auto_recompute(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S, timestep, mask_dict, attn_bias_dict)
+            x = auto_recompute(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S, timestep, mask_dict, attn_bias_dict)
 
         if self.parallel_manager.sp_size > 1:
             x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)

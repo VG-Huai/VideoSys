@@ -54,15 +54,95 @@ class OpenSoraAttention(nn.Module):
             self.rope = True
             self.rotary_emb = rope
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask_dict=None, attn_bias_dict=None, mode='temporal') -> torch.Tensor:
         B, N, C = x.shape
         # flash attn is not memory efficient for small sequences, this is empirical
         use_flash_attn = N >= 30
+        
+        # eff mode
+        if mask_dict is not None:
+            # indices = mask['indices']
+            indices1 = mask_dict[mode]['indices1']
+            indices2 = indices1.squeeze()
+            actual_indices = mask_dict[mode]['actual_indices']
+            mask = mask_dict['mask']
+        if mask is not None:
+            # time_stamp = time.time()
+            mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+            mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)') 
+            attn_bias = attn_bias_dict['self'][mode] 
+        
         qkv = self.qkv(x)
         qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
 
         qkv = qkv.view(qkv_shape).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+
+        if N == 1:
+            x = v
+        else:
+            if self.qk_norm_legacy:
+                # WARNING: this may be a bug
+                if self.rope:
+                    q = self.rotary_emb(q)
+                    k = self.rotary_emb(k)
+                q, k = self.q_norm(q), self.k_norm(k)
+            else:
+                q, k = self.q_norm(q), self.k_norm(k)
+                if self.rope:
+                    q = self.rotary_emb(q)
+                    k = self.rotary_emb(k)
+                    
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+            
+            cat_q = q.reshape(-1, q.shape[-1])
+            cat_q = q.reshape(-1, q.shape[-2], q.shape[-1])
+            cat_q= torch.index_select(cat_q, 0, indices1.squeeze()) 
+            
+            cat_q = cat_q.view(1, -1, self.num_heads, self.head_dim)
+            cat_k = k.view(1, -1, self.num_heads, self.head_dim)
+            cat_v = v.view(1, -1, self.num_heads, self.head_dim)
+            out_with_bias = xformers.ops.memory_efficient_attention(cat_q, cat_k, cat_v, attn_bias=attn_bias, op=None)       
+            dtype = q.dtype
+            x = xformers.ops.memory_efficient_attention(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), attn_bias=None)
+            x = x.to(dtype)
+            x = x.permute(0, 2, 1, 3)
+                
+        x_output_shape = (B, N, C)
+        if not (self.enable_flash_attn and use_flash_attn):
+            x = x.transpose(1, 2)
+
+        x = x.reshape(x_output_shape)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+    def forward_org(self, x: torch.Tensor, mask_dict=None, attn_bias_dict=None, mode='temporal') -> torch.Tensor:
+        B, N, C = x.shape
+        # flash attn is not memory efficient for small sequences, this is empirical
+        use_flash_attn = N >= 30
+        
+        # eff mode
+        if mask_dict is not None:
+            # indices = mask['indices']
+            indices1 = mask_dict[mode]['indices1']
+            indices2 = indices1.squeeze()
+            actual_indices = mask_dict[mode]['actual_indices']
+            mask = mask_dict['mask']
+        if mask is not None:
+            # time_stamp = time.time()
+            mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+            mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)') 
+            attn_bias = attn_bias[mode]['self']        
+        
+        qkv = self.qkv(x)
+        qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
+
+        qkv = qkv.view(qkv_shape).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        
 
         if N == 1:
             x = v

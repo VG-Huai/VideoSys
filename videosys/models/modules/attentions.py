@@ -20,6 +20,7 @@ from videosys.models.modules.normalization import VchitectSpatialNorm, get_rms_n
 
 
 class OpenSoraAttention(nn.Module):
+    
     def __init__(
         self,
         dim: int,
@@ -102,14 +103,47 @@ class OpenSoraAttention(nn.Module):
             cat_q= torch.index_select(cat_q, 0, indices1.squeeze()) 
             
             cat_q = cat_q.view(1, -1, self.num_heads, self.head_dim)
-            cat_k = k.view(1, -1, self.num_heads, self.head_dim)
-            cat_v = v.view(1, -1, self.num_heads, self.head_dim)
-            out_with_bias = xformers.ops.memory_efficient_attention(cat_q, cat_k, cat_v, attn_bias=attn_bias, op=None)       
+            cat_k = k.reshape(1, -1, self.num_heads, self.head_dim)
+            cat_v = v.reshape(1, -1, self.num_heads, self.head_dim)
+            out_with_bias = xformers.ops.memory_efficient_attention(cat_q.to(torch.float32), cat_k.to(torch.float32), cat_v.to(torch.float32), attn_bias=attn_bias)      
+            out_with_bias = out_with_bias.reshape(1, out_with_bias.shape[1], self.num_heads * self.head_dim) # B M HK ---> B M HK
             dtype = q.dtype
-            x = xformers.ops.memory_efficient_attention(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), attn_bias=None)
-            x = x.to(dtype)
-            x = x.permute(0, 2, 1, 3)
-                
+            out_with_bias = out_with_bias.to(dtype)
+            out = torch.zeros_like(x)
+            out = out.reshape(B, out.shape[1], self.num_heads * self.head_dim)
+            out = out.reshape(-1, out.shape[-1])
+            out.index_put_((indices2,), out_with_bias.squeeze())
+            # out = out.reshape(B, x.shape[1], self.num_heads * self.head_dim)  
+            
+            # token reuse, to be 
+            if mask is not None:
+                actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+                if mode == 'spatial':
+                    # x: (B T) S C
+                    out = out.reshape(mask.shape[0], mask.shape[1], -1)  # b * t, h * w, c
+                    out = out.permute(1, 0, 2)
+                    out = out.gather(1, actual_indices).permute(1, 0, 2)
+                    x = out.reshape(mask.shape[0], mask.shape[1], self.num_heads, self.head_dim)
+                    x = x.permute(0, 2, 1, 3) # BMHK ---> BHMK
+                else:
+                    # x: (B S) T C
+                    out = out.reshape(x.shape[0], x.shape[1], C)  # b * t, h * w, c
+                    out = out.gather(1, actual_indices)
+                    x = out.reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim)  
+                    x = x.permute(0, 2, 1, 3) # BMHK ---> BHMK
+            # bug here 
+            # x = out.reshape(B, N, C)     
+                       
+            # x = xformers.ops.memory_efficient_attention(q.to(torch.float32), k.to(torch.float32), v.to(torch.float32), attn_bias=None)
+            # x = x.to(dtype)
+            # x = x.permute(0, 2, 1, 3) # BMHK ---> BHMK
+        # 说实话 费解 为什么要这么写， 为什么要这么写， 为什么要这么写
+        # 在attention计算部分是对的，BMHK 做attention计算，但是为什么在计算完之后要转成BHMK？
+        # 讲道理，C = H * K，是不是应该把HK维度合并到C维度上，然后顺理成章每个token继续做linear projection
+        # 你转成MK就不对劲啊，从MK来reshape到C，不是把原本所有的token都拆开重新整合了吗？
+        # 你是能train出来，我怎么优化啊？
+        # B，N，C 首先把C拆成 H，K，变成 (B, N, H, K), 然后做完attention计算之后，使用permute(0, 2, 1, 3)变成(B, H, N, K)
+        # 然后再reshape成(B, N, C)? 你在干什么?
         x_output_shape = (B, N, C)
         if not (self.enable_flash_attn and use_flash_attn):
             x = x.transpose(1, 2)

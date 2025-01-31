@@ -238,7 +238,8 @@ class STDiT3Block(nn.Module):
         if enable_pab() and broadcast_cross:
             x = x + self.last_cross
         else:
-            x_cross = self.cross_attn(x, y, mask, mask_dict, attn_bias_dict)
+            # x_cross = self.cross_attn(x, y, mask, mask_dict, attn_bias_dict)
+            x_cross = self.cross_attn(x, y, mask)
             if enable_pab():
                 self.last_cross = x_cross
             x = x + x_cross
@@ -548,8 +549,8 @@ class STDiT3(PreTrainedModel):
         # keep_idxs = self.compute_similarity_mask(x, threshold=0.95)
         # keep_idxs = None
         # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.5, tubelet_size=1, patch_size=1)
-        # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.7, tubelet_size=1, patch_size=2)
-        keep_idxs = self.batched_find_idxs_to_keep(x, threshold=2, tubelet_size=1, patch_size=2)
+        keep_idxs = self.batched_find_idxs_to_keep(x, threshold=0.7, tubelet_size=1, patch_size=2)
+        # keep_idxs = self.batched_find_idxs_to_keep(x, threshold=1, tubelet_size=1, patch_size=2)
         print('------------------')
         total_tokens = keep_idxs.numel()
         filtered_tokens = (keep_idxs == 0).sum().item()
@@ -607,10 +608,10 @@ class STDiT3(PreTrainedModel):
         attn_bias_dict = {}
         attn_bias_dict['self'] = {}
         attn_bias_dict['cross'] = {}
-        attn_bias_dict['self']['spatial'] = self.create_block_diagonal_attention_mask(keep_idxs, H * W)
-        attn_bias_dict['self']['temporal'] = self.create_block_diagonal_attention_mask(keep_idxs, T)
-        attn_bias_dict['cross']['spatial'] = self.create_block_diagonal_attention_mask(keep_idxs, y_lens[0])
-        attn_bias_dict['cross']['temporal'] = self.create_block_diagonal_attention_mask(keep_idxs, y_lens[0])
+        attn_bias_dict['self']['spatial'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, H * W)
+        attn_bias_dict['self']['temporal'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, T, mode='temporal')
+        attn_bias_dict['cross']['spatial'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, y_lens[0])
+        attn_bias_dict['cross']['temporal'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, y_lens[0], mode='temporal')
         
         mask_dict = {}
         mask_dict['mask'] = keep_idxs

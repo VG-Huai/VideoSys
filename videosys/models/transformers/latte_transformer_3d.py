@@ -44,7 +44,9 @@ from videosys.core.pab.pab_mgr import (
     if_broadcast_temporal,
     save_mlp_output,
 )
+from videosys.models.transformers.eff_attn import EfficientAttention, XFormersAttnProcessor
 from videosys.utils.utils import batch_func
+from xformers.ops.fmha.attn_bias import BlockDiagonalMask
 
 
 @maybe_allow_in_graph
@@ -256,7 +258,7 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
 
-        self.attn1 = Attention(
+        self.attn1 = EfficientAttention(
             query_dim=dim,
             heads=num_attention_heads,
             dim_head=attention_head_dim,
@@ -265,6 +267,7 @@ class BasicTransformerBlock(nn.Module):
             cross_attention_dim=cross_attention_dim if only_cross_attention else None,
             upcast_attention=upcast_attention,
             out_bias=attention_out_bias,
+            processor=XFormersAttnProcessor(),
         )
 
         # 2. Cross-Attn
@@ -286,7 +289,7 @@ class BasicTransformerBlock(nn.Module):
             else:
                 self.norm2 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
 
-            self.attn2 = Attention(
+            self.attn2 = EfficientAttention(
                 query_dim=dim,
                 cross_attention_dim=cross_attention_dim if not double_self_attention else None,
                 heads=num_attention_heads,
@@ -295,6 +298,7 @@ class BasicTransformerBlock(nn.Module):
                 bias=attention_bias,
                 upcast_attention=upcast_attention,
                 out_bias=attention_out_bias,
+                processor=XFormersAttnProcessor(),
             )  # is self-attn if encoder_hidden_states is none
         else:
             self.norm2 = None
@@ -354,7 +358,179 @@ class BasicTransformerBlock(nn.Module):
     def set_spatial_last(self, last_out: torch.Tensor):
         self.spatial_last = last_out
 
+
     def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        timestep: Optional[torch.LongTensor] = None,
+        cross_attention_kwargs: Dict[str, Any] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+        org_timestep: Optional[torch.LongTensor] = None,
+        all_timesteps=None,
+        mask_dict: Optional[Dict[str, torch.Tensor]] = None,
+        attn_bias_dict: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.FloatTensor:
+        # Notice that normalization is always applied before the real computation in the following blocks.
+        # 0. Self-Attention
+        batch_size = hidden_states.shape[0]
+        # 1. Prepare GLIGEN inputs
+        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+        gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
+
+        if enable_pab():
+            broadcast_spatial, self.spatial_count = if_broadcast_spatial(int(org_timestep[0]), self.spatial_count)
+
+        if enable_pab() and broadcast_spatial:
+            attn_output = self.spatial_last
+            assert self.use_ada_layer_norm_single
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+            ).chunk(6, dim=1)
+        else:
+            if self.norm_type == "ada_norm":
+                norm_hidden_states = self.norm1(hidden_states, timestep)
+            elif self.norm_type == "ada_norm_zero":
+                norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+                    hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
+                )
+            elif self.norm_type in ["layer_norm", "layer_norm_i2vgen"]:
+                norm_hidden_states = self.norm1(hidden_states)
+            elif self.norm_type == "ada_norm_continuous":
+                norm_hidden_states = self.norm1(hidden_states, added_cond_kwargs["pooled_text_emb"])
+            elif self.norm_type == "ada_norm_single":
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                    self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+                ).chunk(6, dim=1)
+                norm_hidden_states = self.norm1(hidden_states) # this branch
+                norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+                norm_hidden_states = norm_hidden_states.squeeze(1)
+            else:
+                raise ValueError("Incorrect norm used")
+
+            if self.pos_embed is not None:
+                norm_hidden_states = self.pos_embed(norm_hidden_states)
+
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                attention_mask=attention_mask,
+                mask_dict=mask_dict,
+                attn_bias_dict=attn_bias_dict,
+                mode="spatial",
+                **cross_attention_kwargs,
+            )
+            if self.norm_type == "ada_norm_zero":
+                attn_output = gate_msa.unsqueeze(1) * attn_output
+            elif self.norm_type == "ada_norm_single":
+                attn_output = gate_msa * attn_output # this branch
+
+            if enable_pab():
+                self.set_spatial_last(attn_output)
+
+        hidden_states = attn_output + hidden_states
+        if hidden_states.ndim == 4:
+            hidden_states = hidden_states.squeeze(1)
+
+        # 1.2 GLIGEN Control
+        if gligen_kwargs is not None:
+            hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
+
+        # 3. Cross-Attention
+        if self.attn2 is not None:
+            broadcast_cross, self.cross_count = if_broadcast_cross(int(org_timestep[0]), self.cross_count)
+            if broadcast_cross:
+                hidden_states = hidden_states + self.cross_last
+            else:
+                if self.norm_type == "ada_norm":
+                    norm_hidden_states = self.norm2(hidden_states, timestep)
+                elif self.norm_type in ["ada_norm_zero", "layer_norm", "layer_norm_i2vgen"]:
+                    norm_hidden_states = self.norm2(hidden_states)
+                elif self.norm_type == "ada_norm_single":
+                    # For PixArt norm2 isn't applied here:
+                    # https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L70C1-L76C103
+                    norm_hidden_states = hidden_states # this branch
+                elif self.norm_type == "ada_norm_continuous":
+                    norm_hidden_states = self.norm2(hidden_states, added_cond_kwargs["pooled_text_emb"])
+                else:
+                    raise ValueError("Incorrect norm")
+
+                if self.pos_embed is not None and self.norm_type != "ada_norm_single":
+                    norm_hidden_states = self.pos_embed(norm_hidden_states)
+
+                attn_output = self.attn2(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    mask_dict=mask_dict,
+                    attn_bias_dict=attn_bias_dict,
+                    mode="spatial",
+                    **cross_attention_kwargs,
+                )
+
+                if enable_pab():
+                    self.set_cross_last(attn_output)
+
+                hidden_states = attn_output + hidden_states
+
+        # 4. Feed-forward
+        # i2vgen doesn't have this norm 🤷‍♂️
+        if enable_pab():
+            broadcast_mlp, self.mlp_count, broadcast_next, broadcast_range = if_broadcast_mlp(
+                int(org_timestep[0]),
+                self.mlp_count,
+                self.block_idx,
+                all_timesteps.tolist(),
+                is_temporal=False,
+            )
+
+        if enable_pab() and broadcast_mlp:
+            ff_output = get_mlp_output(
+                broadcast_range,
+                timestep=int(org_timestep[0]),
+                block_idx=self.block_idx,
+                is_temporal=False,
+            )
+        else:
+            if self.norm_type == "ada_norm_continuous":
+                norm_hidden_states = self.norm3(hidden_states, added_cond_kwargs["pooled_text_emb"])
+            elif not self.norm_type == "ada_norm_single":
+                norm_hidden_states = self.norm3(hidden_states)
+
+            if self.norm_type == "ada_norm_zero":
+                norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+            if self.norm_type == "ada_norm_single": # this branch
+                norm_hidden_states = self.norm2(hidden_states)
+                norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+
+            ff_output = self.ff(norm_hidden_states)
+
+            if self.norm_type == "ada_norm_zero":
+                ff_output = gate_mlp.unsqueeze(1) * ff_output
+            elif self.norm_type == "ada_norm_single":
+                ff_output = gate_mlp * ff_output
+
+            if enable_pab() and broadcast_next:
+                # spatial
+                save_mlp_output(
+                    timestep=int(org_timestep[0]),
+                    block_idx=self.block_idx,
+                    ff_output=ff_output,
+                    is_temporal=False,
+                )
+
+        hidden_states = ff_output + hidden_states
+        if hidden_states.ndim == 4:
+            hidden_states = hidden_states.squeeze(1)
+
+        return hidden_states
+
+
+    def forward_org(
         self,
         hidden_states: torch.FloatTensor,
         attention_mask: Optional[torch.FloatTensor] = None,
@@ -398,7 +574,7 @@ class BasicTransformerBlock(nn.Module):
                 shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                     self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
                 ).chunk(6, dim=1)
-                norm_hidden_states = self.norm1(hidden_states)
+                norm_hidden_states = self.norm1(hidden_states) # this branch
                 norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
                 norm_hidden_states = norm_hidden_states.squeeze(1)
             else:
@@ -416,7 +592,7 @@ class BasicTransformerBlock(nn.Module):
             if self.norm_type == "ada_norm_zero":
                 attn_output = gate_msa.unsqueeze(1) * attn_output
             elif self.norm_type == "ada_norm_single":
-                attn_output = gate_msa * attn_output
+                attn_output = gate_msa * attn_output # this branch
 
             if enable_pab():
                 self.set_spatial_last(attn_output)
@@ -442,7 +618,7 @@ class BasicTransformerBlock(nn.Module):
                 elif self.norm_type == "ada_norm_single":
                     # For PixArt norm2 isn't applied here:
                     # https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L70C1-L76C103
-                    norm_hidden_states = hidden_states
+                    norm_hidden_states = hidden_states # this branch
                 elif self.norm_type == "ada_norm_continuous":
                     norm_hidden_states = self.norm2(hidden_states, added_cond_kwargs["pooled_text_emb"])
                 else:
@@ -490,7 +666,7 @@ class BasicTransformerBlock(nn.Module):
             if self.norm_type == "ada_norm_zero":
                 norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
 
-            if self.norm_type == "ada_norm_single":
+            if self.norm_type == "ada_norm_single": # this branch
                 norm_hidden_states = self.norm2(hidden_states)
                 norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
@@ -608,7 +784,7 @@ class BasicTransformerBlock_(nn.Module):
         else:
             self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)  # go here
 
-        self.attn1 = Attention(
+        self.attn1 = EfficientAttention(
             query_dim=dim,
             heads=num_attention_heads,
             dim_head=attention_head_dim,
@@ -616,6 +792,7 @@ class BasicTransformerBlock_(nn.Module):
             bias=attention_bias,
             cross_attention_dim=cross_attention_dim if only_cross_attention else None,
             upcast_attention=upcast_attention,
+            processor=XFormersAttnProcessor(),
         )
 
         # # 2. Cross-Attn
@@ -676,8 +853,158 @@ class BasicTransformerBlock_(nn.Module):
         # Sets chunk feed-forward
         self._chunk_size = chunk_size
         self._chunk_dim = dim
-
     def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        timestep: Optional[torch.LongTensor] = None,
+        cross_attention_kwargs: Dict[str, Any] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        org_timestep: Optional[torch.LongTensor] = None,
+        all_timesteps=None,
+        mask_dict: Optional[Dict[str, torch.Tensor]] = None,
+        attn_bias_dict: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.FloatTensor:
+        # Notice that normalization is always applied before the real computation in the following blocks.
+        # 0. Self-Attention
+        batch_size = hidden_states.shape[0]
+
+        # 1. Retrieve lora scale.
+        lora_scale = cross_attention_kwargs.get("scale", 1.0) if cross_attention_kwargs is not None else 1.0
+
+        # 2. Prepare GLIGEN inputs
+        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+        gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
+
+        if enable_pab():
+            broadcast_temporal, self.count = if_broadcast_temporal(int(org_timestep[0]), self.count)
+
+        if enable_pab() and broadcast_temporal:
+            attn_output = self.last_out
+            assert self.use_ada_layer_norm_single
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+            ).chunk(6, dim=1)
+        else:
+            if self.use_ada_layer_norm:
+                norm_hidden_states = self.norm1(hidden_states, timestep)
+            elif self.use_ada_layer_norm_zero:
+                norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+                    hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
+                )
+            elif self.use_layer_norm:
+                norm_hidden_states = self.norm1(hidden_states)
+            elif self.use_ada_layer_norm_single:  # go here
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                    self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+                ).chunk(6, dim=1)
+                norm_hidden_states = self.norm1(hidden_states)
+                norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+                # norm_hidden_states = norm_hidden_states.squeeze(1)
+            else:
+                raise ValueError("Incorrect norm used")
+
+            if self.pos_embed is not None:
+                norm_hidden_states = self.pos_embed(norm_hidden_states)
+
+            if self.parallel_manager.sp_size > 1:
+                norm_hidden_states = self.dynamic_switch(norm_hidden_states, to_spatial_shard=True)
+
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                attention_mask=attention_mask,
+                mask_dict=mask_dict,
+                attn_bias_dict=attn_bias_dict,
+                mode="temporal",
+                **cross_attention_kwargs,
+            )
+
+            if self.parallel_manager.sp_size > 1:
+                attn_output = self.dynamic_switch(attn_output, to_spatial_shard=False)
+
+            if self.use_ada_layer_norm_zero:
+                attn_output = gate_msa.unsqueeze(1) * attn_output
+            elif self.use_ada_layer_norm_single:
+                attn_output = gate_msa * attn_output
+
+            if enable_pab():
+                self.last_out = attn_output
+
+        hidden_states = attn_output + hidden_states
+
+        if enable_pab():
+            broadcast_mlp, self.mlp_count, broadcast_next, broadcast_range = if_broadcast_mlp(
+                int(org_timestep[0]),
+                self.mlp_count,
+                self.block_idx,
+                all_timesteps.tolist(),
+                is_temporal=True,
+            )
+
+        if enable_pab() and broadcast_mlp:
+            ff_output = get_mlp_output(
+                broadcast_range,
+                timestep=int(org_timestep[0]),
+                block_idx=self.block_idx,
+                is_temporal=True,
+            )
+        else:
+            if hidden_states.ndim == 4:
+                hidden_states = hidden_states.squeeze(1)
+
+            # 2.5 GLIGEN Control
+            if gligen_kwargs is not None:
+                hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
+
+            if self.use_ada_layer_norm_zero:
+                norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+            if self.use_ada_layer_norm_single:
+                # norm_hidden_states = self.norm2(hidden_states)
+                norm_hidden_states = self.norm3(hidden_states)
+                norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+
+            if self._chunk_size is not None:
+                # "feed_forward_chunk_size" can be used to save memory
+                if norm_hidden_states.shape[self._chunk_dim] % self._chunk_size != 0:
+                    raise ValueError(
+                        f"`hidden_states` dimension to be chunked: {norm_hidden_states.shape[self._chunk_dim]} has to be divisible by chunk size: {self._chunk_size}. Make sure to set an appropriate `chunk_size` when calling `unet.enable_forward_chunking`."
+                    )
+
+                num_chunks = norm_hidden_states.shape[self._chunk_dim] // self._chunk_size
+                ff_output = torch.cat(
+                    [
+                        self.ff(hid_slice, scale=lora_scale)
+                        for hid_slice in norm_hidden_states.chunk(num_chunks, dim=self._chunk_dim)
+                    ],
+                    dim=self._chunk_dim,
+                )
+            else:
+                ff_output = self.ff(norm_hidden_states, scale=lora_scale)
+
+            if self.use_ada_layer_norm_zero:
+                ff_output = gate_mlp.unsqueeze(1) * ff_output
+            elif self.use_ada_layer_norm_single:
+                ff_output = gate_mlp * ff_output
+
+            if enable_pab() and broadcast_next:
+                save_mlp_output(
+                    timestep=int(org_timestep[0]),
+                    block_idx=self.block_idx,
+                    ff_output=ff_output,
+                    is_temporal=True,
+                )
+
+        hidden_states = ff_output + hidden_states
+        if hidden_states.ndim == 4:
+            hidden_states = hidden_states.squeeze(1)
+
+        return hidden_states
+    
+    def forward_org(
         self,
         hidden_states: torch.FloatTensor,
         attention_mask: Optional[torch.FloatTensor] = None,
@@ -1217,6 +1544,34 @@ class LatteT2V(ModelMixin, ConfigMixin):
             )
 
         input_batch_size, c, frame, h, w = hidden_states.shape
+        
+        # filter toekn percentage
+        keep_idxs = self.batched_find_idxs_to_keep(hidden_states, threshold=0.5, tubelet_size=1, patch_size=2)
+        print('------------------')
+        total_tokens = keep_idxs.numel()
+        filtered_tokens = (keep_idxs == 0).sum().item()
+        filtered_percentage = 100.0 * filtered_tokens / total_tokens
+        print('timestep:', timestep)
+        print(f"Mask Filtering: {filtered_percentage:.2f}% tokens filtered")    
+        
+        # prepare mask and attn_bias
+        attn_bias_dict = {}
+        attn_bias_dict['self'] = {}
+        attn_bias_dict['cross'] = {}
+        attn_bias_dict['self']['spatial'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, h * w // 4)
+        attn_bias_dict['self']['temporal'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, frame, mode='temporal')
+        # attn_bias_dict['cross']['spatial'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, encoder_hidden_states.shape[0])
+        # attn_bias_dict['cross']['temporal'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, encoder_hidden_states.shape[0], mode='temporal')
+        
+        mask_dict = {}
+        mask_dict['mask'] = keep_idxs
+        mask_dict['spatial'] = {}
+        mask_dict['temporal'] = {}
+        mask_dict = self.compute_mask_dict_spatial(mask_dict, h // 2, w // 2)
+        mask_dict = self.compute_mask_dict_temporal(mask_dict, h // 2, w// 2)
+        
+        
+            
         frame = frame - use_image_num
         hidden_states = rearrange(hidden_states, "b c f h w -> (b f) c h w").contiguous()
         org_timestep = timestep
@@ -1308,7 +1663,8 @@ class LatteT2V(ModelMixin, ConfigMixin):
             )
         else:
             temp_pos_embed = self.temp_pos_embed
-
+        attn_bias_dict['cross']['spatial'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, encoder_hidden_states.shape[1])
+        attn_bias_dict['cross']['temporal'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, encoder_hidden_states.shape[1], mode='temporal')
         for i, (spatial_block, temp_block) in enumerate(zip(self.transformer_blocks, self.temporal_transformer_blocks)):
             if self.training and self.gradient_checkpointing:
                 hidden_states = torch.utils.checkpoint.checkpoint(
@@ -1321,6 +1677,8 @@ class LatteT2V(ModelMixin, ConfigMixin):
                     cross_attention_kwargs,
                     class_labels,
                     use_reentrant=False,
+                    mask_dict=mask_dict,
+                    attn_bias_dict=attn_bias_dict,
                 )
 
                 if enable_temporal_attentions:
@@ -1343,6 +1701,8 @@ class LatteT2V(ModelMixin, ConfigMixin):
                             cross_attention_kwargs,
                             class_labels,
                             use_reentrant=False,
+                            mask_dict=mask_dict,
+                            attn_bias_dict=attn_bias_dict,
                         )
 
                         hidden_states = torch.cat([hidden_states_video, hidden_states_image], dim=1)
@@ -1369,7 +1729,7 @@ class LatteT2V(ModelMixin, ConfigMixin):
                         hidden_states = rearrange(
                             hidden_states, "(b t) f d -> (b f) t d", b=input_batch_size
                         ).contiguous()
-            else:
+            else: # this branch
                 hidden_states = spatial_block(
                     hidden_states,
                     attention_mask,
@@ -1381,6 +1741,8 @@ class LatteT2V(ModelMixin, ConfigMixin):
                     None,
                     org_timestep,
                     all_timesteps=all_timesteps,
+                    mask_dict=mask_dict,
+                    attn_bias_dict=attn_bias_dict,
                 )
 
                 if enable_temporal_attentions:
@@ -1399,6 +1761,8 @@ class LatteT2V(ModelMixin, ConfigMixin):
                             cross_attention_kwargs,
                             class_labels,
                             org_timestep,
+                            mask_dict=mask_dict,
+                            attn_bias_dict=attn_bias_dict,
                         )
 
                         hidden_states = torch.cat([hidden_states_video, hidden_states_image], dim=1)
@@ -1419,6 +1783,8 @@ class LatteT2V(ModelMixin, ConfigMixin):
                             class_labels,
                             org_timestep,
                             all_timesteps=all_timesteps,
+                            mask_dict=mask_dict,
+                            attn_bias_dict=attn_bias_dict,
                         )
 
                         hidden_states = rearrange(
@@ -1464,7 +1830,205 @@ class LatteT2V(ModelMixin, ConfigMixin):
             return (output,)
 
         return Transformer3DModelOutput(sample=output)
+    
+    def create_block_diagonal_attention_mask(self, mask, kv_seqlen, mode='spatial'):
+        """
+        将 mask 和 kv_seqlen 转换为 BlockDiagonalMask, 用于高效的注意力计算。
+        
+        Args:
+            mask (torch.Tensor): 输入的掩码，标记哪些 token 应该被忽略。
+            kv_seqlen (torch.Tensor): 键/值的序列长度。
+            heads (int): 注意力头的数量。
 
+        Returns:
+            BlockDiagonalPaddedKeysMask: 转换后的注意力掩码，用于高效的计算。
+        """
+        # 计算 q_seqlen: 通过 mask 来提取有效的查询 token 数量
+        mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        if mode == 'spatial':
+            mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)')
+        else:
+            mask = rearrange(mask, 'b 1 t h w -> (b h w) (t)')
+        
+        q_seqlen = mask.sum(dim=-1)  # 计算每个批次中有效的查询 token 数量
+        q_seqlen = q_seqlen.tolist()
+        
+        kv_seqlen = [kv_seqlen] * len(q_seqlen)  # 重复 kv_seqlen 次
+
+        # 生成 BlockDiagonalPaddedKeysMask
+        attn_bias = BlockDiagonalMask.from_seqlens(
+            q_seqlen,  
+            kv_seqlen=kv_seqlen,  # 键/值的序列长度
+        )
+        
+        return attn_bias, q_seqlen, kv_seqlen    
+    
+    def compute_mask_dict_spatial(self, mask_dict, cur_h, cur_w):
+        mask = mask_dict['mask']
+        indices = []
+        _mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
+        _mask = rearrange(_mask, 'b 1 t h w -> (b t) (h w)')
+        # for i in range(_mask.size(0)):
+        #     index_per_batch = torch.where(_mask[i].bool())[0]
+        #     indices.append(index_per_batch)
+        mask_dict['spatial']['indices'] = indices
+        mask_dict['spatial']['indices1'] = indices1
+        mask_bool = _mask.bool()
+        mask_bool = mask_bool.T
+        device = mask.device
+        batch_size, seq_len = mask_bool.shape
+        # print('------------------')
+        # time_stamp = time.time()
+        arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        # print('time for arange_indices:', time.time()-time_stamp)
+        # time_stamp = time.time()
+        nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
+        valid_indices = torch.zeros_like(arange_indices)
+        valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
+        cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
+        # print('time for cumsum_mask:', time.time()-time_stamp)
+        # time_stamp = time.time()
+        nearest_indices = torch.clip(cumsum_mask - 1, min=0)
+        # print('time for nearest_indices:', time.time()-time_stamp)
+        # time_stamp = time.time()
+        actual_indices = valid_indices.gather(1, nearest_indices)
+        mask_dict['spatial']['actual_indices'] = actual_indices
+        return mask_dict
+        
+    def compute_mask_dict_temporal(self, mask_dict, cur_h, cur_w):
+        mask = mask_dict['mask']
+        indices = []
+        _mask = torch.round(mask).to(torch.int)
+        _mask = rearrange(_mask, 'b 1 t h w -> (b h w) (t)')
+        indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
+        mask_dict['temporal']['indices'] = indices
+        mask_dict['temporal']['indices1'] = indices1
+        mask_bool = _mask.bool()
+        device = mask.device
+        batch_size, seq_len = mask_bool.shape
+        arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
+        valid_indices = torch.zeros_like(arange_indices)
+        valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
+        cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
+        nearest_indices = torch.clip(cumsum_mask - 1, min=0)
+        actual_indices = valid_indices.gather(1, nearest_indices)
+        mask_dict['temporal']['actual_indices'] = actual_indices
+        return mask_dict    
+    
+    def batched_find_idxs_to_keep(self, 
+                            x: torch.Tensor, 
+                            threshold: int=2, 
+                            tubelet_size: int=2,
+                            patch_size: int=16) -> torch.Tensor:
+        """
+        Find the static tokens in a video tensor, and return a mask
+        that selects tokens that are not repeated.
+
+        Args:
+        - x (torch.Tensor): A tensor of shape [B, C, T, H, W].
+        - threshold (int): The mean intensity threshold for considering
+                a token as static.
+        - tubelet_size (int): The temporal length of a token.
+        Returns:
+        - mask (torch.Tensor): A bool tensor of shape [B, T, H, W] 
+            that selects tokens that are not repeated.
+
+        """
+        # Ensure input has the format [B, C, T, H, W]
+        assert len(x.shape) == 5, "Input must be a 5D tensor"
+        #ipdb.set_trace()
+        # Convert to float32 if not already
+        x = x.type(torch.float32)
+        
+        # Calculate differences between frames with a step of tubelet_size, ensuring batch dimension is preserved
+        # Compare "front" of first token to "back" of second token
+        diffs = x[:, :, (2*tubelet_size-1)::tubelet_size] - x[:, :, :-tubelet_size:tubelet_size]
+        # Ensure nwe track negative movement.
+        diffs = torch.abs(diffs)
+        
+        # Apply average pooling over spatial dimensions while keeping the batch dimension intact
+        avg_pool_blocks = F.avg_pool3d(diffs, (1, patch_size, patch_size))
+        # Compute the mean along the channel dimension, preserving the batch dimension
+        avg_pool_blocks = torch.mean(avg_pool_blocks, dim=1, keepdim=True)
+        # Create a dummy first frame for each item in the batch
+        first_frame = torch.ones_like(avg_pool_blocks[:, :, 0:1]) * 255
+        # first_frame = torch.zeros_like(avg_pool_blocks[:, :, 0:1])
+        # Concatenate the dummy first frame with the rest of the frames, preserving the batch dimension
+        avg_pool_blocks = torch.cat([first_frame, avg_pool_blocks], dim=2)
+        # Determine indices to keep based on the threshold, ensuring the operation is applied across the batch
+        # Update mask: 0 for high similarity, 1 for low similarity
+        keep_idxs = avg_pool_blocks.squeeze(1) > threshold  
+        keep_idxs = keep_idxs.unsqueeze(1)
+        keep_idxs = keep_idxs.float()
+        # Flatten out everything but the batch dimension
+        # keep_idxs = keep_idxs.flatten(1)
+        #ipdb.set_trace()
+        return keep_idxs
+
+    def compute_similarity_mask(self, latent, threshold=0.95):
+        """
+        Compute frame-wise similarity for latent and generate mask.
+
+        Args:
+        - latent (torch.Tensor): Latent tensor of shape [n, c, t, h, w].
+        - threshold (float): Similarity threshold to determine whether to skip computation.
+
+        Returns:
+        - mask (torch.Tensor): Mask tensor of shape [n, 1, t, h, w],
+        where mask = 0 means skip computation, mask = 1 means recompute.
+        """
+        n, c, t, h, w = latent.shape
+        mask = torch.ones((n, 1, t, h, w), device=latent.device)  # Initialize mask with all 1s
+
+        for frame_idx in range(1, t):  # Start from the second frame
+            curr_frame = latent[:, :, frame_idx, :, :]  # Current frame [n, c, h, w]
+            prev_frame = latent[:, :, frame_idx - 1, :, :]  # Previous frame [n, c, h, w]
+
+            # Compute token-wise cosine similarity
+            dot_product = (curr_frame * prev_frame).sum(dim=1, keepdim=True)  # [n, 1, h, w]
+            norm_curr = curr_frame.norm(dim=1, keepdim=True)
+            norm_prev = prev_frame.norm(dim=1, keepdim=True)
+            similarity = dot_product / (norm_curr * norm_prev + 1e-8)  # Avoid division by zero
+
+            # Update mask: 0 for high similarity, 1 for low similarity
+            mask[:, :, frame_idx, :, :] = (similarity <= threshold).float()
+        # mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        return mask
+    
+    def resize_mask(self, mask, target_h, target_w):
+        """
+        Resize the mask to match the new spatial dimensions of x.
+
+        Args:
+        - mask (torch.Tensor): Input mask of shape [b, 1, t, h, w].
+        - target_h (int): Target height.
+        - target_w (int): Target width.
+
+        Returns:
+        - resized_mask (torch.Tensor): Resized mask of shape [b, 1, t, target_h, target_w].
+        """
+        if mask is None:
+            return mask
+        batch, _, t, h, w = mask.shape
+
+        if h == target_h and w == target_w:
+            return mask  # No resizing needed
+
+        # Reshape to [b * t, 1, h, w]
+        mask = mask.view(batch * t, 1, h, w)
+
+        # Resize to [b * t, 1, target_h, target_w]
+        resized_mask = F.interpolate(mask, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        # Ensure the mask is binary (0 or 1)
+        resized_mask = (resized_mask > 0.5).float()
+
+        # Reshape back to [b, 1, t, target_h, target_w]
+        resized_mask = resized_mask.view(batch, 1, t, target_h, target_w)
+
+        return resized_mask
     def get_1d_sincos_temp_embed(self, embed_dim, length):
         pos = torch.arange(0, length).unsqueeze(1)
         return get_1d_sincos_pos_embed_from_grid(embed_dim, pos)

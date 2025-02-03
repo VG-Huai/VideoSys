@@ -380,58 +380,70 @@ class BasicTransformerBlock(nn.Module):
         # 1. Prepare GLIGEN inputs
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
+        
+        # prepare filtered hidden states
+        B, M, C = hidden_states.shape
+        indices1 = mask_dict['spatial']['indices1']
+        indices2 = indices1.squeeze()
+        actual_indices = mask_dict['spatial']['actual_indices']
+        filtered_hidden_states = self.get_filtered_tensor(hidden_states, indices1)
+        # filtered_hidden_states = hidden_states.reshape(-1, C)
+        # filtered_hidden_states = torch.index_select(filtered_hidden_states, 0, indices1.squeeze())
+        # filtered_hidden_states = filtered_hidden_states.reshape(1, -1, C)
 
-        if enable_pab():
-            broadcast_spatial, self.spatial_count = if_broadcast_spatial(int(org_timestep[0]), self.spatial_count)
 
-        if enable_pab() and broadcast_spatial:
-            attn_output = self.spatial_last
-            assert self.use_ada_layer_norm_single
+        if self.norm_type == "ada_norm":
+            norm_hidden_states = self.norm1(hidden_states, timestep)
+        elif self.norm_type == "ada_norm_zero":
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+                hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
+            )
+        elif self.norm_type in ["layer_norm", "layer_norm_i2vgen"]:
+            norm_hidden_states = self.norm1(hidden_states)
+        elif self.norm_type == "ada_norm_continuous":
+            norm_hidden_states = self.norm1(hidden_states, added_cond_kwargs["pooled_text_emb"])
+        elif self.norm_type == "ada_norm_single":
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
             ).chunk(6, dim=1)
+            shift_msa1 = self.get_filtered_tensor(shift_msa.expand(-1, M, -1), indices1)
+            scale_msa1 = self.get_filtered_tensor(scale_msa.expand(-1, M, -1), indices1)
+            gate_msa1 = self.get_filtered_tensor(gate_msa.expand(-1, M, -1), indices1)
+            shift_mlp1 = self.get_filtered_tensor(shift_mlp.expand(-1, M, -1), indices1)
+            scale_mlp1 = self.get_filtered_tensor(scale_mlp.expand(-1, M, -1), indices1)
+            gate_mlp1 = self.get_filtered_tensor(gate_mlp.expand(-1, M, -1), indices1)
+            norm_hidden_states = self.norm1(hidden_states) # this branch
+            norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+            norm_hidden_states = norm_hidden_states.squeeze(1)
+            
+            norm_filtered_hidden_states = self.norm1(filtered_hidden_states) # this branch
+            norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_msa1) + shift_msa1
+            
         else:
-            if self.norm_type == "ada_norm":
-                norm_hidden_states = self.norm1(hidden_states, timestep)
-            elif self.norm_type == "ada_norm_zero":
-                norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
-                    hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
-                )
-            elif self.norm_type in ["layer_norm", "layer_norm_i2vgen"]:
-                norm_hidden_states = self.norm1(hidden_states)
-            elif self.norm_type == "ada_norm_continuous":
-                norm_hidden_states = self.norm1(hidden_states, added_cond_kwargs["pooled_text_emb"])
-            elif self.norm_type == "ada_norm_single":
-                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                    self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
-                ).chunk(6, dim=1)
-                norm_hidden_states = self.norm1(hidden_states) # this branch
-                norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
-                norm_hidden_states = norm_hidden_states.squeeze(1)
-            else:
-                raise ValueError("Incorrect norm used")
+            raise ValueError("Incorrect norm used")
 
-            if self.pos_embed is not None:
-                norm_hidden_states = self.pos_embed(norm_hidden_states)
+        if self.pos_embed is not None:
+            norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-            attn_output = self.attn1(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
-                attention_mask=attention_mask,
-                mask_dict=mask_dict,
-                attn_bias_dict=attn_bias_dict,
-                mode="spatial",
-                **cross_attention_kwargs,
-            )
-            if self.norm_type == "ada_norm_zero":
-                attn_output = gate_msa.unsqueeze(1) * attn_output
-            elif self.norm_type == "ada_norm_single":
-                attn_output = gate_msa * attn_output # this branch
+        attn_output, filtered_attn_output = self.attn1(
+            norm_hidden_states,
+            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+            attention_mask=attention_mask,
+            mask_dict=mask_dict,
+            attn_bias_dict=attn_bias_dict,
+            mode="spatial",
+            **cross_attention_kwargs,
+        )
+        if self.norm_type == "ada_norm_zero":
+            attn_output = gate_msa.unsqueeze(1) * attn_output
+        elif self.norm_type == "ada_norm_single":
+            attn_output = gate_msa * attn_output # this branch
+            
+            filtered_attn_output = gate_msa1 * filtered_attn_output
 
-            if enable_pab():
-                self.set_spatial_last(attn_output)
 
         hidden_states = attn_output + hidden_states
+        filtered_hidden_states = filtered_attn_output + filtered_hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
@@ -461,7 +473,7 @@ class BasicTransformerBlock(nn.Module):
                 if self.pos_embed is not None and self.norm_type != "ada_norm_single":
                     norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-                attn_output = self.attn2(
+                attn_output, filtered_attn_output = self.attn2(
                     norm_hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=encoder_attention_mask,
@@ -471,63 +483,68 @@ class BasicTransformerBlock(nn.Module):
                     **cross_attention_kwargs,
                 )
 
-                if enable_pab():
-                    self.set_cross_last(attn_output)
-
                 hidden_states = attn_output + hidden_states
+                filtered_hidden_states = filtered_attn_output + filtered_hidden_states
 
         # 4. Feed-forward
         # i2vgen doesn't have this norm 🤷‍♂️
-        if enable_pab():
-            broadcast_mlp, self.mlp_count, broadcast_next, broadcast_range = if_broadcast_mlp(
-                int(org_timestep[0]),
-                self.mlp_count,
-                self.block_idx,
-                all_timesteps.tolist(),
-                is_temporal=False,
-            )
 
-        if enable_pab() and broadcast_mlp:
-            ff_output = get_mlp_output(
-                broadcast_range,
-                timestep=int(org_timestep[0]),
-                block_idx=self.block_idx,
-                is_temporal=False,
-            )
-        else:
-            if self.norm_type == "ada_norm_continuous":
-                norm_hidden_states = self.norm3(hidden_states, added_cond_kwargs["pooled_text_emb"])
-            elif not self.norm_type == "ada_norm_single":
-                norm_hidden_states = self.norm3(hidden_states)
+        if self.norm_type == "ada_norm_continuous":
+            norm_hidden_states = self.norm3(hidden_states, added_cond_kwargs["pooled_text_emb"])
+        elif not self.norm_type == "ada_norm_single":
+            norm_hidden_states = self.norm3(hidden_states)
 
-            if self.norm_type == "ada_norm_zero":
-                norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        if self.norm_type == "ada_norm_zero":
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
 
-            if self.norm_type == "ada_norm_single": # this branch
-                norm_hidden_states = self.norm2(hidden_states)
-                norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        if self.norm_type == "ada_norm_single": # this branch
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+            
+            norm_filtered_hidden_states = self.norm2(filtered_hidden_states)
+            norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_mlp1) + shift_mlp1
 
-            ff_output = self.ff(norm_hidden_states)
+        ff_output = self.ff(norm_hidden_states)
+        ff_output_filtered = self.ff(norm_filtered_hidden_states)
 
-            if self.norm_type == "ada_norm_zero":
-                ff_output = gate_mlp.unsqueeze(1) * ff_output
-            elif self.norm_type == "ada_norm_single":
-                ff_output = gate_mlp * ff_output
-
-            if enable_pab() and broadcast_next:
-                # spatial
-                save_mlp_output(
-                    timestep=int(org_timestep[0]),
-                    block_idx=self.block_idx,
-                    ff_output=ff_output,
-                    is_temporal=False,
-                )
+        if self.norm_type == "ada_norm_zero":
+            ff_output = gate_mlp.unsqueeze(1) * ff_output
+        elif self.norm_type == "ada_norm_single":
+            ff_output = gate_mlp * ff_output
+            ff_output_filtered = gate_mlp1 * ff_output_filtered
 
         hidden_states = ff_output + hidden_states
+        filtered_hidden_states = ff_output_filtered + filtered_hidden_states
+        
+        filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices1.squeeze(), actual_indices, 'spatial')
+        
+        
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
-        return hidden_states
+        return filtered_hidden_states
+        # return hidden_states
+    
+    
+
+    def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
+        out = torch.zeros_like(x_in)
+        out = out.reshape(-1, out.shape[-1])
+        out.index_put_((indices,), x_out.squeeze())
+        out = out.reshape(x_in.shape[0], x_in.shape[1], -1) 
+        actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+        if mode == 'spatial':
+            out = out.permute(1, 0, 2)
+            out = out.gather(1, actual_indices).permute(1, 0, 2)
+        else:
+            out = out.gather(1, actual_indices)
+        return out
+
+    def get_filtered_tensor(self, x, indices):
+        x = x.reshape(-1, x.shape[-1])
+        x = torch.index_select(x, 0, indices.squeeze())
+        x = x.reshape(1, -1, x.shape[-1])
+        return x
 
 
     def forward_org(
@@ -878,62 +895,70 @@ class BasicTransformerBlock_(nn.Module):
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
-        if enable_pab():
-            broadcast_temporal, self.count = if_broadcast_temporal(int(org_timestep[0]), self.count)
+        # prepare filtered hidden states
+        B, M, C = hidden_states.shape
+        indices1 = mask_dict['temporal']['indices1']
+        indices2 = indices1.squeeze()
+        actual_indices = mask_dict['temporal']['actual_indices']
+        filtered_hidden_states = self.get_filtered_tensor(hidden_states, indices1)
+        
 
-        if enable_pab() and broadcast_temporal:
-            attn_output = self.last_out
-            assert self.use_ada_layer_norm_single
+        if self.use_ada_layer_norm:
+            norm_hidden_states = self.norm1(hidden_states, timestep)
+        elif self.use_ada_layer_norm_zero:
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+                hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
+            )
+        elif self.use_layer_norm:
+            norm_hidden_states = self.norm1(hidden_states)
+        elif self.use_ada_layer_norm_single:  # go here
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
             ).chunk(6, dim=1)
+            
+            shift_msa1 = self.get_filtered_tensor(shift_msa.expand(-1, M, -1), indices1)
+            scale_msa1 = self.get_filtered_tensor(scale_msa.expand(-1, M, -1), indices1)
+            gate_msa1 = self.get_filtered_tensor(gate_msa.expand(-1, M, -1), indices1)
+            shift_mlp1 = self.get_filtered_tensor(shift_mlp.expand(-1, M, -1), indices1)
+            scale_mlp1 = self.get_filtered_tensor(scale_mlp.expand(-1, M, -1), indices1)
+            gate_mlp1 = self.get_filtered_tensor(gate_mlp.expand(-1, M, -1), indices1)
+            norm_hidden_states = self.norm1(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+            # norm_hidden_states = norm_hidden_states.squeeze(1)
+            
+            norm_filtered_hidden_states = self.norm1(filtered_hidden_states)
+            norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_msa1) + shift_msa1
+            
         else:
-            if self.use_ada_layer_norm:
-                norm_hidden_states = self.norm1(hidden_states, timestep)
-            elif self.use_ada_layer_norm_zero:
-                norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
-                    hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
-                )
-            elif self.use_layer_norm:
-                norm_hidden_states = self.norm1(hidden_states)
-            elif self.use_ada_layer_norm_single:  # go here
-                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                    self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
-                ).chunk(6, dim=1)
-                norm_hidden_states = self.norm1(hidden_states)
-                norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
-                # norm_hidden_states = norm_hidden_states.squeeze(1)
-            else:
-                raise ValueError("Incorrect norm used")
+            raise ValueError("Incorrect norm used")
 
-            if self.pos_embed is not None:
-                norm_hidden_states = self.pos_embed(norm_hidden_states)
+        if self.pos_embed is not None:
+            norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-            if self.parallel_manager.sp_size > 1:
-                norm_hidden_states = self.dynamic_switch(norm_hidden_states, to_spatial_shard=True)
+        if self.parallel_manager.sp_size > 1:
+            norm_hidden_states = self.dynamic_switch(norm_hidden_states, to_spatial_shard=True)
 
-            attn_output = self.attn1(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
-                attention_mask=attention_mask,
-                mask_dict=mask_dict,
-                attn_bias_dict=attn_bias_dict,
-                mode="temporal",
-                **cross_attention_kwargs,
-            )
+        attn_output, filtered_attn_output = self.attn1(
+            norm_hidden_states,
+            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+            attention_mask=attention_mask,
+            mask_dict=mask_dict,
+            attn_bias_dict=attn_bias_dict,
+            mode="temporal",
+            **cross_attention_kwargs,
+        )
 
-            if self.parallel_manager.sp_size > 1:
-                attn_output = self.dynamic_switch(attn_output, to_spatial_shard=False)
+        if self.parallel_manager.sp_size > 1:
+            attn_output = self.dynamic_switch(attn_output, to_spatial_shard=False)
 
-            if self.use_ada_layer_norm_zero:
-                attn_output = gate_msa.unsqueeze(1) * attn_output
-            elif self.use_ada_layer_norm_single:
-                attn_output = gate_msa * attn_output
-
-            if enable_pab():
-                self.last_out = attn_output
+        if self.use_ada_layer_norm_zero:
+            attn_output = gate_msa.unsqueeze(1) * attn_output
+        elif self.use_ada_layer_norm_single:
+            attn_output = gate_msa * attn_output
+            filtered_attn_output = gate_msa1 * filtered_attn_output
 
         hidden_states = attn_output + hidden_states
+        filtered_hidden_states = filtered_attn_output + filtered_hidden_states
 
         if enable_pab():
             broadcast_mlp, self.mlp_count, broadcast_next, broadcast_range = if_broadcast_mlp(
@@ -966,6 +991,9 @@ class BasicTransformerBlock_(nn.Module):
                 # norm_hidden_states = self.norm2(hidden_states)
                 norm_hidden_states = self.norm3(hidden_states)
                 norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+                
+                norm_filtered_hidden_states = self.norm3(filtered_hidden_states)
+                norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_mlp1) + shift_mlp1
 
             if self._chunk_size is not None:
                 # "feed_forward_chunk_size" can be used to save memory
@@ -984,11 +1012,13 @@ class BasicTransformerBlock_(nn.Module):
                 )
             else:
                 ff_output = self.ff(norm_hidden_states, scale=lora_scale)
+                ff_output_filtered = self.ff(norm_filtered_hidden_states, scale=lora_scale)
 
             if self.use_ada_layer_norm_zero:
                 ff_output = gate_mlp.unsqueeze(1) * ff_output
             elif self.use_ada_layer_norm_single:
                 ff_output = gate_mlp * ff_output
+                ff_output_filtered = gate_mlp1 * ff_output_filtered
 
             if enable_pab() and broadcast_next:
                 save_mlp_output(
@@ -999,11 +1029,34 @@ class BasicTransformerBlock_(nn.Module):
                 )
 
         hidden_states = ff_output + hidden_states
+        filtered_hidden_states = ff_output_filtered + filtered_hidden_states
+        filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices2, actual_indices, 'temporal')
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
-        return hidden_states
+        return filtered_hidden_states
+        # return hidden_states
     
+    
+    def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
+        out = torch.zeros_like(x_in)
+        out = out.reshape(-1, out.shape[-1])
+        out.index_put_((indices,), x_out.squeeze())
+        out = out.reshape(x_in.shape[0], x_in.shape[1], -1) 
+        actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+        if mode == 'spatial':
+            out = out.permute(1, 0, 2)
+            out = out.gather(1, actual_indices).permute(1, 0, 2)
+        else:
+            out = out.gather(1, actual_indices)
+        return out
+
+    def get_filtered_tensor(self, x, indices):
+        x = x.reshape(-1, x.shape[-1])
+        x = torch.index_select(x, 0, indices.squeeze())
+        x = x.reshape(1, -1, x.shape[-1])
+        return x
+        
     def forward_org(
         self,
         hidden_states: torch.FloatTensor,

@@ -44,100 +44,6 @@ class EfficientAttention(Attention):
 
         return output
     
-class EffAttnProcessor2_0:
-    r"""
-    Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
-    """
-
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-
-    def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        if len(args) > 0 or kwargs.get("scale", None) is not None:
-            deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
-            deprecate("scale", "1.0.0", deprecation_message)
-
-        residual = hidden_states
-        if attn.spatial_norm is not None:
-            hidden_states = attn.spatial_norm(hidden_states, temb)
-
-        input_ndim = hidden_states.ndim
-
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-
-        batch_size, sequence_length, _ = (
-            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-        )
-
-        if attention_mask is not None:
-            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-            # scaled_dot_product_attention expects attention_mask shape to be
-            # (batch, heads, source_length, target_length)
-            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
-
-        if attn.group_norm is not None:
-            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-
-        query = attn.to_q(hidden_states)
-
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        elif attn.norm_cross:
-            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
-
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
-
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-
-        # the output of sdp = (batch, num_heads, seq_len, head_dim)
-        # TODO: add support for attn.scale when we move to Torch 2.1
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-        )
-
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-        hidden_states = hidden_states.to(query.dtype)
-
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
-
-        if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
-
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
-
-        hidden_states = hidden_states / attn.rescale_output_factor
-
-        return hidden_states
-    
-    
 class XFormersAttnProcessor:
     r"""
     Processor for implementing memory efficient attention using xFormers.
@@ -203,17 +109,6 @@ class XFormersAttnProcessor:
         else:
             attention_mask = attn_bias_dict['self'][mode]
 
-        # attention_mask = attn.prepare_attention_mask(attention_mask, key_tokens, batch_size)
-        # if attention_mask is not None:
-        #     # expand our mask's singleton query_tokens dimension:
-        #     #   [batch*heads,            1, key_tokens] ->
-        #     #   [batch*heads, query_tokens, key_tokens]
-        #     # so that it can be added as a bias onto the attention scores that xformers computes:
-        #     #   [batch*heads, query_tokens, key_tokens]
-        #     # we do this explicitly because xformers doesn't broadcast the singleton dimension for us.
-        #     _, query_tokens, _ = hidden_states.shape
-        #     attention_mask = attention_mask.expand(-1, query_tokens, -1)
-
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
@@ -249,42 +144,31 @@ class XFormersAttnProcessor:
         
         # token reuse, to be 
         if mask is not None:
-            actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+            actual_indices1 = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
             if mode == 'spatial':
                 # x: (B T) S C
                 out = out.reshape(mask.shape[0], mask.shape[1], -1)  # b * t, h * w, c
                 out = out.permute(1, 0, 2)
-                out = out.gather(1, actual_indices).permute(1, 0, 2)
-                # out = out.reshape(mask.shape[0], mask.shape[1], self.num_heads, self.head_dim)
-                # x = x.permute(0, 2, 1, 3) # BMHK ---> BHMK
+                out = out.gather(1, actual_indices1).permute(1, 0, 2)
+
             else:
                 # x: (B S) T C
                 out = out.reshape(B, M, C)  # b * t, h * w, c
-                out = out.gather(1, actual_indices)
-                # out = out.reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim)  
-                # x = x.permute(0, 2, 1, 3) # BMHK ---> BHMK
+                out = out.gather(1, actual_indices1)
+
         hidden_states = out
-        # hidden_states = xformers.ops.memory_efficient_attention(
-        #     query, key, value, attn_bias=attention_mask, op=self.attention_op, scale=attn.scale
-        # )
-        # hidden_states = hidden_states.to(query.dtype)
         hidden_states = hidden_states.reshape(B, M, C)
         
-        
-        # query = attn.head_to_batch_dim(query).contiguous()
-        # key = attn.head_to_batch_dim(key).contiguous()
-        # value = attn.head_to_batch_dim(value).contiguous()
-
-        # hidden_states = xformers.ops.memory_efficient_attention(
-        #     query, key, value, attn_bias=attention_mask, op=self.attention_op, scale=attn.scale
-        # )
-        # hidden_states = hidden_states.to(query.dtype)
-        # hidden_states = attn.batch_to_head_dim(hidden_states)
+        assert (hidden_states != self.token_reuse(hidden_states, out_with_bias, indices2, actual_indices, mode)).sum() == 0
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
         # dropout
         hidden_states = attn.to_out[1](hidden_states)
+        
+        filtered_hidden_states = attn.to_out[0](out_with_bias)
+        filtered_hidden_states = attn.to_out[1](filtered_hidden_states)
+        # filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices2, actual_indices, mode)
 
         if input_ndim == 4:
             hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
@@ -293,5 +177,27 @@ class XFormersAttnProcessor:
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
+        filtered_hidden_states = filtered_hidden_states / attn.rescale_output_factor
 
-        return hidden_states
+        return hidden_states, filtered_hidden_states
+    
+    def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
+        out = torch.zeros_like(x_in)
+        out = out.reshape(-1, out.shape[-1])
+        out.index_put_((indices,), x_out.squeeze())
+        out = out.reshape(x_in.shape[0], x_in.shape[1], -1) 
+        actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+        if mode == 'spatial':
+            out = out.permute(1, 0, 2)
+            out = out.gather(1, actual_indices).permute(1, 0, 2)
+        else:
+            out = out.gather(1, actual_indices)
+        return out
+    def get_filtered_tensor(self, x, indices):
+        x = x.reshape(-1, x.shape[-1])
+        x = torch.index_select(x, 0, indices.squeeze())
+        x = x.reshape(1, -1, x.shape[-1])
+        return x
+    def max_diff(self, A, B, name_A, name_B):
+        diff = (A - B).abs().max().item()
+        print(f"Max error between {name_A} and {name_B}: {diff:.6f}")

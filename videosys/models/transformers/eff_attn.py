@@ -165,7 +165,20 @@ class XFormersAttnProcessor:
         hidden_states = attn.to_out[0](hidden_states)
         # dropout
         hidden_states = attn.to_out[1](hidden_states)
-        
+        # here is a demo for linear proj  mismatch
+        # out1 = out.permute(1, 0, 2)
+        # aa = attn.to_out[0](out)
+        # bb = attn.to_out[0](out1).permute(1, 0, 2)
+        # cc = attn.to_out[0](out_with_bias)
+        # cc = self.token_reuse(hidden_states, cc, indices2, actual_indices, mode)
+        # (aa != bb).sum()
+        # tensor(2094130, device='cuda:0')
+        # (aa != cc).sum()
+        # tensor(2094130, device='cuda:0')
+        # (bb != cc).sum()
+        # tensor(0, device='cuda:0')
+        # torch.allclose(aa.reshape_as(bb), bb, atol=1e-4, rtol=1e-3)
+        # True
         filtered_hidden_states = attn.to_out[0](out_with_bias)
         filtered_hidden_states = attn.to_out[1](filtered_hidden_states)
         # filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices2, actual_indices, mode)

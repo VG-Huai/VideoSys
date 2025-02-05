@@ -1,5 +1,5 @@
 from videosys import LatteConfig, VideoSysEngine
-
+import time
 
 def run_base():
     # change num_gpus for multi-gpu inference
@@ -7,8 +7,11 @@ def run_base():
     engine = VideoSysEngine(config)
 
     prompt = "Sunset over the sea."
+    prompt = "goldfish in glass"
+    prompt = "a horse"
     # video size is fixed to 16 frames, 512x512.
     # seed=-1 means random seed. >0 means fixed seed.
+    start_time = time.time()
     video = engine.generate(
         prompt=prompt,
         guidance_scale=7.5,
@@ -16,6 +19,8 @@ def run_base():
         seed=-1,
     ).video[0]
     engine.save_video(video, f"./outputs/{prompt}.mp4")
+    end_time = time.time()
+    print(f"Time elapsed: {end_time - start_time:.2f}s")
 
 
 def run_low_mem():

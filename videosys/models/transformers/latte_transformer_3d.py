@@ -382,11 +382,13 @@ class BasicTransformerBlock(nn.Module):
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
         
         # prepare filtered hidden states
-        B, M, C = hidden_states.shape
-        indices1 = mask_dict['spatial']['indices1']
-        indices2 = indices1.squeeze()
-        actual_indices = mask_dict['spatial']['actual_indices']
-        filtered_hidden_states = self.get_filtered_tensor(hidden_states, indices1)
+        # B, M, C = hidden_states.shape
+        # indices1 = mask_dict['spatial']['indices1']
+        # indices2 = indices1.squeeze()
+        # actual_indices = mask_dict['spatial']['actual_indices']
+        # filtered_hidden_states = self.get_filtered_tensor(hidden_states, indices1)
+        # check if filtered_hidden_states is correct
+        # print(self.check_filtered_tensor(hidden_states, filtered_hidden_states, indices2, actual_indices))
         # filtered_hidden_states = hidden_states.reshape(-1, C)
         # filtered_hidden_states = torch.index_select(filtered_hidden_states, 0, indices1.squeeze())
         # filtered_hidden_states = filtered_hidden_states.reshape(1, -1, C)
@@ -406,18 +408,22 @@ class BasicTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
             ).chunk(6, dim=1)
-            shift_msa1 = self.get_filtered_tensor(shift_msa.expand(-1, M, -1), indices1)
-            scale_msa1 = self.get_filtered_tensor(scale_msa.expand(-1, M, -1), indices1)
-            gate_msa1 = self.get_filtered_tensor(gate_msa.expand(-1, M, -1), indices1)
-            shift_mlp1 = self.get_filtered_tensor(shift_mlp.expand(-1, M, -1), indices1)
-            scale_mlp1 = self.get_filtered_tensor(scale_mlp.expand(-1, M, -1), indices1)
-            gate_mlp1 = self.get_filtered_tensor(gate_mlp.expand(-1, M, -1), indices1)
+            # shift_msa1 = self.get_filtered_tensor(shift_msa.expand(-1, M, -1), indices1)
+            # scale_msa1 = self.get_filtered_tensor(scale_msa.expand(-1, M, -1), indices1)
+            # gate_msa1 = self.get_filtered_tensor(gate_msa.expand(-1, M, -1), indices1)
+            # shift_mlp1 = self.get_filtered_tensor(shift_mlp.expand(-1, M, -1), indices1)
+            # scale_mlp1 = self.get_filtered_tensor(scale_mlp.expand(-1, M, -1), indices1)
+            # gate_mlp1 = self.get_filtered_tensor(gate_mlp.expand(-1, M, -1), indices1)
             norm_hidden_states = self.norm1(hidden_states) # this branch
+            # norm_filtered_hidden_states = self.norm1(filtered_hidden_states) # this branch
+            # print(self.check_filtered_tensor(norm_hidden_states, norm_filtered_hidden_states, indices2, actual_indices))
+            
             norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
             norm_hidden_states = norm_hidden_states.squeeze(1)
+            # norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_msa1) + shift_msa1
             
-            norm_filtered_hidden_states = self.norm1(filtered_hidden_states) # this branch
-            norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_msa1) + shift_msa1
+            # check if norm_hidden_states and norm_filtered_hidden_states are the same
+            # print(self.check_filtered_tensor(norm_hidden_states, norm_filtered_hidden_states, indices2, actual_indices))
             
         else:
             raise ValueError("Incorrect norm used")
@@ -425,7 +431,7 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-        attn_output, filtered_attn_output = self.attn1(
+        attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask,
@@ -433,17 +439,21 @@ class BasicTransformerBlock(nn.Module):
             attn_bias_dict=attn_bias_dict,
             mode="spatial",
             **cross_attention_kwargs,
-        )
+        ) # attn_output, filtered_attn_output use same value
+        # print(self.check_filtered_tensor(attn_output, filtered_attn_output, indices2, actual_indices))
         if self.norm_type == "ada_norm_zero":
             attn_output = gate_msa.unsqueeze(1) * attn_output
         elif self.norm_type == "ada_norm_single":
             attn_output = gate_msa * attn_output # this branch
             
-            filtered_attn_output = gate_msa1 * filtered_attn_output
+            # filtered_attn_output = gate_msa1 * filtered_attn_output
 
 
+        # filtered_hidden_states = hidden_states + self.token_reuse(hidden_states, filtered_attn_output, indices2, actual_indices, 'spatial')
+        # cat_x2 = filtered_hidden_states + filtered_attn_output
         hidden_states = attn_output + hidden_states
-        filtered_hidden_states = filtered_attn_output + filtered_hidden_states
+        
+        # filtered_hidden_states = filtered_attn_output + filtered_hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
@@ -473,7 +483,7 @@ class BasicTransformerBlock(nn.Module):
                 if self.pos_embed is not None and self.norm_type != "ada_norm_single":
                     norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-                attn_output, filtered_attn_output = self.attn2(
+                attn_output = self.attn2(
                     norm_hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=encoder_attention_mask,
@@ -482,9 +492,24 @@ class BasicTransformerBlock(nn.Module):
                     mode="spatial",
                     **cross_attention_kwargs,
                 )
-
+                # x1 = hidden_states
+                # cat_x1 = filtered_attn_output
+                # x2 = self.token_reuse(hidden_states, cat_x1, indices1.squeeze(), actual_indices, 'spatial') + x1
+                # cat_x2 = self.get_filtered_tensor(x2, indices1)
+                # cat_x2 = self.norm2(cat_x2)
+                # cat_x2 = cat_x2 * (1 + scale_mlp1) + shift_mlp1
+                
+                
+                # cat_x3 = self.ff(cat_x2)
+                # cat_x3 = cat_x3 * gate_mlp1
+                # x3 = self.token_reuse(hidden_states, cat_x3, indices1.squeeze(), actual_indices, 'spatial') + x2
+                # cat_x4 = self.get_filtered_tensor(x3, indices1)
+                # x4 = self.token_reuse(hidden_states, cat_x4, indices1.squeeze(), actual_indices, 'spatial')
+                
+                # hidden_states2 = hidden_states + self.token_reuse(hidden_states, filtered_attn_output, indices2, actual_indices, 'spatial')
+                
                 hidden_states = attn_output + hidden_states
-                filtered_hidden_states = filtered_attn_output + filtered_hidden_states
+                # filtered_hidden_states = filtered_attn_output + filtered_hidden_states
 
         # 4. Feed-forward
         # i2vgen doesn't have this norm 🤷‍♂️
@@ -501,31 +526,50 @@ class BasicTransformerBlock(nn.Module):
             norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
             
-            norm_filtered_hidden_states = self.norm2(filtered_hidden_states)
-            norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_mlp1) + shift_mlp1
+            
+            # norm_filtered_hidden_states2 = self.norm2(self.get_filtered_tensor(hidden_states2, indices1))
+            # norm_filtered_hidden_states2 = norm_filtered_hidden_states2 * (1 + scale_mlp1) + shift_mlp1
+            
 
         ff_output = self.ff(norm_hidden_states)
-        ff_output_filtered = self.ff(norm_filtered_hidden_states)
+        # ff_output_filtered = self.ff(norm_filtered_hidden_states2)
 
         if self.norm_type == "ada_norm_zero":
             ff_output = gate_mlp.unsqueeze(1) * ff_output
         elif self.norm_type == "ada_norm_single":
             ff_output = gate_mlp * ff_output
-            ff_output_filtered = gate_mlp1 * ff_output_filtered
+            # ff_output_filtered = gate_mlp1 * ff_output_filtered
 
+        # h2 = self.token_reuse(hidden_states, ff_output_filtered, indices2, actual_indices, 'spatial') + hidden_states
         hidden_states = ff_output + hidden_states
-        filtered_hidden_states = ff_output_filtered + filtered_hidden_states
         
-        filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices1.squeeze(), actual_indices, 'spatial')
+        
+        
+        # filtered_hidden_states = ff_output_filtered + filtered_hidden_states
+        
+        # filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices1.squeeze(), actual_indices, 'spatial')
         
         
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
-
-        return filtered_hidden_states
-        # return hidden_states
-    
-    
+        # print(self.max_diff(hidden_states, h2, 'hidden_states', 'h2'))
+        # print(self.check_filtered_tensor(hidden_states, h2, indices2, actual_indices))
+        # return x4
+        # return h2
+        return hidden_states
+    def max_diff(self, A, B, name_A, name_B):
+        diff = (A - B).abs().max().item()
+        print(f"Max error between {name_A} and {name_B}: {diff:.6f}")
+    def check_filtered_tensor(self, x, filtered_x, indices, actual_indices):
+        if x.shape != filtered_x.shape:
+            reconstructed_x = self.token_reuse(x, filtered_x, indices, actual_indices, 'spatial')
+        else:
+            reconstructed_x = filtered_x
+        aa = (reconstructed_x != x).sum()
+        print(aa)
+        if aa == 0:
+            return True
+        return False
 
     def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
         out = torch.zeros_like(x_in)
@@ -896,12 +940,12 @@ class BasicTransformerBlock_(nn.Module):
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
         # prepare filtered hidden states
-        B, M, C = hidden_states.shape
-        indices1 = mask_dict['temporal']['indices1']
-        indices2 = indices1.squeeze()
-        actual_indices = mask_dict['temporal']['actual_indices']
-        filtered_hidden_states = self.get_filtered_tensor(hidden_states, indices1)
-        
+        # B, M, C = hidden_states.shape
+        # indices1 = mask_dict['temporal']['indices1']
+        # indices2 = indices1.squeeze()
+        # actual_indices = mask_dict['temporal']['actual_indices']
+        # filtered_hidden_states = self.get_filtered_tensor(hidden_states, indices1)
+        # print(self.check_filtered_tensor(hidden_states, filtered_hidden_states, indices2, actual_indices))
 
         if self.use_ada_layer_norm:
             norm_hidden_states = self.norm1(hidden_states, timestep)
@@ -916,19 +960,19 @@ class BasicTransformerBlock_(nn.Module):
                 self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
             ).chunk(6, dim=1)
             
-            shift_msa1 = self.get_filtered_tensor(shift_msa.expand(-1, M, -1), indices1)
-            scale_msa1 = self.get_filtered_tensor(scale_msa.expand(-1, M, -1), indices1)
-            gate_msa1 = self.get_filtered_tensor(gate_msa.expand(-1, M, -1), indices1)
-            shift_mlp1 = self.get_filtered_tensor(shift_mlp.expand(-1, M, -1), indices1)
-            scale_mlp1 = self.get_filtered_tensor(scale_mlp.expand(-1, M, -1), indices1)
-            gate_mlp1 = self.get_filtered_tensor(gate_mlp.expand(-1, M, -1), indices1)
+            # shift_msa1 = self.get_filtered_tensor(shift_msa.expand(-1, M, -1), indices1)
+            # scale_msa1 = self.get_filtered_tensor(scale_msa.expand(-1, M, -1), indices1)
+            # gate_msa1 = self.get_filtered_tensor(gate_msa.expand(-1, M, -1), indices1)
+            # shift_mlp1 = self.get_filtered_tensor(shift_mlp.expand(-1, M, -1), indices1)
+            # scale_mlp1 = self.get_filtered_tensor(scale_mlp.expand(-1, M, -1), indices1)
+            # gate_mlp1 = self.get_filtered_tensor(gate_mlp.expand(-1, M, -1), indices1)
             norm_hidden_states = self.norm1(hidden_states)
             norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
             # norm_hidden_states = norm_hidden_states.squeeze(1)
             
-            norm_filtered_hidden_states = self.norm1(filtered_hidden_states)
-            norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_msa1) + shift_msa1
-            
+            # norm_filtered_hidden_states = self.norm1(filtered_hidden_states)
+            # norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_msa1) + shift_msa1
+            # print(self.check_filtered_tensor(norm_hidden_states, norm_filtered_hidden_states, indices2, actual_indices))
         else:
             raise ValueError("Incorrect norm used")
 
@@ -938,7 +982,7 @@ class BasicTransformerBlock_(nn.Module):
         if self.parallel_manager.sp_size > 1:
             norm_hidden_states = self.dynamic_switch(norm_hidden_states, to_spatial_shard=True)
 
-        attn_output, filtered_attn_output = self.attn1(
+        attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask,
@@ -947,7 +991,7 @@ class BasicTransformerBlock_(nn.Module):
             mode="temporal",
             **cross_attention_kwargs,
         )
-
+        # print(self.check_filtered_tensor(attn_output, filtered_attn_output, indices2, actual_indices))
         if self.parallel_manager.sp_size > 1:
             attn_output = self.dynamic_switch(attn_output, to_spatial_shard=False)
 
@@ -955,10 +999,11 @@ class BasicTransformerBlock_(nn.Module):
             attn_output = gate_msa.unsqueeze(1) * attn_output
         elif self.use_ada_layer_norm_single:
             attn_output = gate_msa * attn_output
-            filtered_attn_output = gate_msa1 * filtered_attn_output
+            # filtered_attn_output = gate_msa1 * filtered_attn_output
 
+        # filtered_hidden_states = hidden_states + self.token_reuse(hidden_states, filtered_attn_output, indices2, actual_indices, 'temporal')
         hidden_states = attn_output + hidden_states
-        filtered_hidden_states = filtered_attn_output + filtered_hidden_states
+        # filtered_hidden_states = filtered_attn_output + filtered_hidden_states
 
         if enable_pab():
             broadcast_mlp, self.mlp_count, broadcast_next, broadcast_range = if_broadcast_mlp(
@@ -992,8 +1037,8 @@ class BasicTransformerBlock_(nn.Module):
                 norm_hidden_states = self.norm3(hidden_states)
                 norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
                 
-                norm_filtered_hidden_states = self.norm3(filtered_hidden_states)
-                norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_mlp1) + shift_mlp1
+                # norm_filtered_hidden_states = self.norm3(self.get_filtered_tensor(hidden_states, indices1))
+                # norm_filtered_hidden_states = norm_filtered_hidden_states * (1 + scale_mlp1) + shift_mlp1
 
             if self._chunk_size is not None:
                 # "feed_forward_chunk_size" can be used to save memory
@@ -1012,13 +1057,13 @@ class BasicTransformerBlock_(nn.Module):
                 )
             else:
                 ff_output = self.ff(norm_hidden_states, scale=lora_scale)
-                ff_output_filtered = self.ff(norm_filtered_hidden_states, scale=lora_scale)
+                # ff_output_filtered = self.ff(norm_filtered_hidden_states, scale=lora_scale)
 
             if self.use_ada_layer_norm_zero:
                 ff_output = gate_mlp.unsqueeze(1) * ff_output
             elif self.use_ada_layer_norm_single:
                 ff_output = gate_mlp * ff_output
-                ff_output_filtered = gate_mlp1 * ff_output_filtered
+                # ff_output_filtered = gate_mlp1 * ff_output_filtered
 
             if enable_pab() and broadcast_next:
                 save_mlp_output(
@@ -1028,17 +1073,25 @@ class BasicTransformerBlock_(nn.Module):
                     is_temporal=True,
                 )
 
+        # h2 = self.token_reuse(hidden_states, ff_output_filtered, indices2, actual_indices, 'temporal') + hidden_states
         hidden_states = ff_output + hidden_states
-        filtered_hidden_states = ff_output_filtered + filtered_hidden_states
-        filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices2, actual_indices, 'temporal')
+        # filtered_hidden_states = ff_output_filtered + filtered_hidden_states
+        # filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices2, actual_indices, 'temporal')
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
 
-        return filtered_hidden_states
-        # return hidden_states
+        # return h2
+        return hidden_states
     
-    
-    def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
+    def check_filtered_tensor(self, x, filtered_x, indices, actual_indices):
+        reconstructed_x = self.token_reuse(x, filtered_x, indices, actual_indices, 'temporal')
+        aa = (reconstructed_x != x).sum()
+        print(aa)
+        if aa == 0:
+            return True
+        return False
+
+    def token_reuse(self, x_in, x_out, indices, actual_indices, mode='temporal'):
         out = torch.zeros_like(x_in)
         out = out.reshape(-1, out.shape[-1])
         out.index_put_((indices,), x_out.squeeze())
@@ -1056,6 +1109,7 @@ class BasicTransformerBlock_(nn.Module):
         x = torch.index_select(x, 0, indices.squeeze())
         x = x.reshape(1, -1, x.shape[-1])
         return x
+
         
     def forward_org(
         self,
@@ -1599,7 +1653,7 @@ class LatteT2V(ModelMixin, ConfigMixin):
         input_batch_size, c, frame, h, w = hidden_states.shape
         
         # filter toekn percentage
-        keep_idxs = self.batched_find_idxs_to_keep(hidden_states, threshold=0.5, tubelet_size=1, patch_size=2)
+        keep_idxs = self.batched_find_idxs_to_keep(hidden_states, threshold=0.7, tubelet_size=1, patch_size=2)
         print('------------------')
         total_tokens = keep_idxs.numel()
         filtered_tokens = (keep_idxs == 0).sum().item()
@@ -1718,6 +1772,15 @@ class LatteT2V(ModelMixin, ConfigMixin):
             temp_pos_embed = self.temp_pos_embed
         attn_bias_dict['cross']['spatial'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, encoder_hidden_states.shape[1])
         attn_bias_dict['cross']['temporal'], _, _ = self.create_block_diagonal_attention_mask(keep_idxs, encoder_hidden_states.shape[1], mode='temporal')
+        
+        # hidden_states modify, failed
+        # B, M, C = hidden_states.shape
+        # indices1 = mask_dict['spatial']['indices1']
+        # indices2 = indices1.squeeze()
+        # actual_indices = mask_dict['spatial']['actual_indices']
+        # filtered_hidden_states = self.get_filtered_tensor(hidden_states, indices1)
+        # hidden_states= self.token_reuse(hidden_states, filtered_hidden_states, indices2, actual_indices, 'spatial')
+        
         for i, (spatial_block, temp_block) in enumerate(zip(self.transformer_blocks, self.temporal_transformer_blocks)):
             if self.training and self.gradient_checkpointing:
                 hidden_states = torch.utils.checkpoint.checkpoint(
@@ -1883,7 +1946,24 @@ class LatteT2V(ModelMixin, ConfigMixin):
             return (output,)
 
         return Transformer3DModelOutput(sample=output)
-    
+    def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
+        out = torch.zeros_like(x_in)
+        out = out.reshape(-1, out.shape[-1])
+        out.index_put_((indices,), x_out.squeeze())
+        out = out.reshape(x_in.shape[0], x_in.shape[1], -1) 
+        actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+        if mode == 'spatial':
+            out = out.permute(1, 0, 2)
+            out = out.gather(1, actual_indices).permute(1, 0, 2)
+        else:
+            out = out.gather(1, actual_indices)
+        return out
+
+    def get_filtered_tensor(self, x, indices):
+        x = x.reshape(-1, x.shape[-1])
+        x = torch.index_select(x, 0, indices.squeeze())
+        x = x.reshape(1, -1, x.shape[-1])
+        return x
     def create_block_diagonal_attention_mask(self, mask, kv_seqlen, mode='spatial'):
         """
         将 mask 和 kv_seqlen 转换为 BlockDiagonalMask, 用于高效的注意力计算。

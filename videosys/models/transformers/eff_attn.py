@@ -159,12 +159,16 @@ class XFormersAttnProcessor:
         hidden_states = out
         hidden_states = hidden_states.reshape(B, M, C)
         
-        assert (hidden_states != self.token_reuse(hidden_states, out_with_bias, indices2, actual_indices, mode)).sum() == 0
+        # assert (hidden_states != self.token_reuse(hidden_states, out_with_bias, indices2, actual_indices, mode)).sum() == 0
 
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
+        # linear proj, for stride mismatch
+        if mode == 'spatial':
+            hidden_states = attn.to_out[0](hidden_states.permute(1, 0, 2))
+            # dropout
+            hidden_states = attn.to_out[1](hidden_states).permute(1, 0, 2)
+        else:
+            hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[1](hidden_states)
         # here is a demo for linear proj  mismatch
         # out1 = out.permute(1, 0, 2)
         # aa = attn.to_out[0](out)
@@ -179,8 +183,8 @@ class XFormersAttnProcessor:
         # tensor(0, device='cuda:0')
         # torch.allclose(aa.reshape_as(bb), bb, atol=1e-4, rtol=1e-3)
         # True
-        filtered_hidden_states = attn.to_out[0](out_with_bias)
-        filtered_hidden_states = attn.to_out[1](filtered_hidden_states)
+        # filtered_hidden_states = attn.to_out[0](out_with_bias)
+        # filtered_hidden_states = attn.to_out[1](filtered_hidden_states)
         # filtered_hidden_states = self.token_reuse(hidden_states, filtered_hidden_states, indices2, actual_indices, mode)
 
         if input_ndim == 4:
@@ -190,9 +194,10 @@ class XFormersAttnProcessor:
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
-        filtered_hidden_states = filtered_hidden_states / attn.rescale_output_factor
+        # filtered_hidden_states = filtered_hidden_states / attn.rescale_output_factor
 
-        return hidden_states, filtered_hidden_states
+        # return hidden_states, filtered_hidden_states
+        return hidden_states
     
     def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
         out = torch.zeros_like(x_in)

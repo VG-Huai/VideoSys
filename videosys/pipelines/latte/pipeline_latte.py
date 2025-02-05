@@ -30,7 +30,7 @@ from videosys.core.pab.pab_mgr import PABConfig, set_pab_manager, update_steps
 from videosys.core.pipeline.pipeline import VideoSysPipeline, VideoSysPipelineOutput
 from videosys.models.transformers.latte_transformer_3d import LatteT2V
 from videosys.utils.utils import save_video, set_seed
-
+import numpy as np
 
 class LattePABConfig(PABConfig):
     def __init__(
@@ -801,6 +801,25 @@ class LattePipeline(VideoSysPipeline):
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        # ddim_discretize="quad2"
+        # timesteps = make_ddim_timesteps(ddim_discretize, num_inference_steps, 1000)
+        # timesteps = torch.tensor([
+        #         998, 958, 919, 880, 842, 805, 769, 733, 699, 665, 
+        #         632, 600, 569, 539, 509, 480, 453, 426, 399, 374, 
+        #         349, 326, 303, 281, 260, 239, 220, 201, 183, 166, 
+        #         150, 134, 120, 106, 93, 81, 70, 59, 50, 41, 
+        #         33, 26, 20, 14, 10, 6, 3, 2, 1, 0  # 删除最后一个0避免重复
+        #     ], device="cuda:0")
+        # # timesteps = timesteps[::-1]
+        # timesteps = torch.tensor(timesteps).to(device)
+        # # timesteps = torch.flip(timesteps, dims=[0])
+        # # self.scheduler.set_timesteps(timesteps=timesteps, device="cuda")
+        # self.scheduler.timesteps = timesteps
+        # self.num_inference_steps = num_inference_steps
+        # 重新计算 alphas_cumprod
+        # self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to("cuda")[self.scheduler.timesteps]
+
+        
 
         # 5. Prepare latents.
         latent_channels = self.transformer.config.in_channels
@@ -949,3 +968,30 @@ class LattePipeline(VideoSysPipeline):
 
     def save_video(self, video, output_path):
         save_video(video, output_path, fps=8)
+
+def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timesteps):
+    if ddim_discr_method == 'uniform':
+        c = num_ddpm_timesteps // num_ddim_timesteps
+        ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
+    elif ddim_discr_method == 'quad':
+        ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .8), num_ddim_timesteps)) ** 2).astype(int)
+    elif ddim_discr_method == 'quad2':
+        ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .999), num_ddim_timesteps)) ** 2).astype(int)
+    elif ddim_discr_method == 'log':
+        # 生成对数空间时间步
+        ddim_timesteps = (np.logspace(0, np.log10(num_ddpm_timesteps), num_ddim_timesteps) - 1).astype(int)
+        ddim_timesteps[-1] = num_ddpm_timesteps - 2
+
+    elif ddim_discr_method == 'exp':
+        ddim_timesteps = (np.exp(np.linspace(0, np.log(num_ddpm_timesteps), num_ddim_timesteps)) - 1).astype(int)
+        
+    
+    else:
+        raise NotImplementedError(f'There is no ddim discretization method called "{ddim_discr_method}"')
+    print(f'Selected timesteps for ddim sampler: {ddim_timesteps}')
+    # assert ddim_timesteps.shape[0] == num_ddim_timesteps
+    # add one to get the final alpha values right (the ones from first scale to data during sampling)
+    steps_out = ddim_timesteps + 0
+    # if verbose:
+    #     print(f'Selected timesteps for ddim sampler: {steps_out}')
+    return steps_out

@@ -6,9 +6,9 @@ def run_base():
     config = LatteConfig("maxin-cn/Latte-1", num_gpus=1)
     engine = VideoSysEngine(config)
 
-    prompt = "Sunset over the sea."
+    # prompt = "Sunset over the sea."
     prompt = "goldfish in glass"
-    prompt = "a horse"
+    # prompt = "a horse"
     # video size is fixed to 16 frames, 512x512.
     # seed=-1 means random seed. >0 means fixed seed.
     start_time = time.time()
@@ -16,7 +16,7 @@ def run_base():
         prompt=prompt,
         guidance_scale=7.5,
         num_inference_steps=50,
-        seed=-1,
+        seed=123,
     ).video[0]
     engine.save_video(video, f"./outputs/{prompt}.mp4")
     end_time = time.time()

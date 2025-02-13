@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL, AutoencoderKLTemporalDecoder
 from diffusers.schedulers import DDIMScheduler
+from .ddim import CustomDDIMScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import T5EncoderModel, T5Tokenizer
 
@@ -222,7 +223,7 @@ class LattePipeline(VideoSysPipeline):
                 config.model_path, subfolder="text_encoder", torch_dtype=dtype
             )
         if scheduler is None:
-            scheduler = DDIMScheduler.from_pretrained(
+            scheduler = CustomDDIMScheduler.from_pretrained(
                 config.model_path,
                 subfolder="scheduler",
                 beta_start=config.beta_start,
@@ -801,8 +802,10 @@ class LattePipeline(VideoSysPipeline):
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        # breakpoint()
         # ddim_discretize="quad2"
-        # timesteps = make_ddim_timesteps(ddim_discretize, num_inference_steps, 1000)
+        ddim_discretize='uniform'
+        timesteps = make_ddim_timesteps(ddim_discretize, num_inference_steps, 1000)
         # timesteps = torch.tensor([
         #         998, 958, 919, 880, 842, 805, 769, 733, 699, 665, 
         #         632, 600, 569, 539, 509, 480, 453, 426, 399, 374, 
@@ -811,10 +814,10 @@ class LattePipeline(VideoSysPipeline):
         #         33, 26, 20, 14, 10, 6, 3, 2, 1, 0  # 删除最后一个0避免重复
         #     ], device="cuda:0")
         # # timesteps = timesteps[::-1]
-        # timesteps = torch.tensor(timesteps).to(device)
+        timesteps = torch.tensor(timesteps).to(device)
         # # timesteps = torch.flip(timesteps, dims=[0])
         # # self.scheduler.set_timesteps(timesteps=timesteps, device="cuda")
-        # self.scheduler.timesteps = timesteps
+        self.scheduler.timesteps = timesteps
         # self.num_inference_steps = num_inference_steps
         # 重新计算 alphas_cumprod
         # self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to("cuda")[self.scheduler.timesteps]
@@ -991,7 +994,26 @@ def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timestep
     print(f'Selected timesteps for ddim sampler: {ddim_timesteps}')
     # assert ddim_timesteps.shape[0] == num_ddim_timesteps
     # add one to get the final alpha values right (the ones from first scale to data during sampling)
+    ddim_timesteps = interpolate_duplicates(ddim_timesteps)
     steps_out = ddim_timesteps + 0
     # if verbose:
     #     print(f'Selected timesteps for ddim sampler: {steps_out}')
-    return steps_out
+    return steps_out[::-1].copy()
+
+def interpolate_duplicates(arr):
+    """ 用线性插值替换数组中重复的值，保持时间步的平滑性 """
+    unique, counts = np.unique(arr, return_counts=True)
+    
+    if np.all(counts == 1):  # 没有重复项
+        return arr
+    for i in range(len(arr) - 1):
+        if arr[i] >= arr[i + 1]:
+            arr[i + 1] = arr[i] + 1
+    # 逐步调整重复值
+    # for i in range(len(arr) - 1, 0, -1):
+    #     if arr[i] == arr[i - 1]:  # 发现重复值
+    #         arr[i] = arr[i - 1] - 1  # 线性递减，确保单调性
+    #         if arr[i] < 0:
+    #             arr[i] = 0  # 防止负数
+
+    return arr

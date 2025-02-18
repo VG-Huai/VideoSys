@@ -6,7 +6,9 @@ def run_base():
     config = VchitectConfig("Vchitect/Vchitect-2.0-2B", num_gpus=1)
     engine = VideoSysEngine(config)
 
-    prompt = "Sunset over the sea."
+    # prompt = "Sunset over the sea."
+    prompt = "goldfish in glass"
+    prompt = "a cat drinking beer"
     # seed=-1 means random seed. >0 means fixed seed.
     # WxH: 480x288 624x352 432x240 768x432
     video = engine.generate(
@@ -16,7 +18,8 @@ def run_base():
         guidance_scale=7.5,
         width=480,
         height=288,
-        frames=40,
+        # frames=40,
+        frames=16,
         seed=0,
     ).video[0]
     engine.save_video(video, f"./outputs/{prompt}.mp4")

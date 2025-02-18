@@ -1009,11 +1009,5 @@ def interpolate_duplicates(arr):
     for i in range(len(arr) - 1):
         if arr[i] >= arr[i + 1]:
             arr[i + 1] = arr[i] + 1
-    # 逐步调整重复值
-    # for i in range(len(arr) - 1, 0, -1):
-    #     if arr[i] == arr[i - 1]:  # 发现重复值
-    #         arr[i] = arr[i - 1] - 1  # 线性递减，确保单调性
-    #         if arr[i] < 0:
-    #             arr[i] = 0  # 防止负数
 
     return arr

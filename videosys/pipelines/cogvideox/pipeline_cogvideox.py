@@ -29,7 +29,7 @@ from videosys.models.transformers.cogvideox_transformer_3d import CogVideoXTrans
 from videosys.schedulers.scheduling_ddim_cogvideox import CogVideoXDDIMScheduler
 from videosys.schedulers.scheduling_dpm_cogvideox import CogVideoXDPMScheduler
 from videosys.utils.utils import save_video, set_seed
-
+import numpy as np
 
 class CogVideoXPABConfig(PABConfig):
     def __init__(
@@ -644,10 +644,22 @@ class CogVideoXPipeline(VideoSysPipeline):
         )
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-
+        
+        # custom timesteps
+        
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        ddim_discretize='uniform'
+        # ddim_discretize = 'quad2'
+        # ddim_discretize = 'log'
+        timesteps = make_ddim_timesteps(ddim_discretize, num_inference_steps, 1000)
+        timesteps = torch.tensor(timesteps).to(device)
+        self.scheduler.timesteps = timesteps
+        
+        # num_inference_steps = len(timesteps)
         # 4. Prepare timesteps, default uniform timesteps, total 50 steps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        # timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
         self._num_timesteps = len(timesteps)
+        timesteps = torch.tensor(timesteps).to(device)
 
         # 5. Prepare latents.
         latent_channels = self.transformer.config.in_channels
@@ -685,12 +697,14 @@ class CogVideoXPipeline(VideoSysPipeline):
 
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                # latents shape: [B, C, T, H, W]
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
-
-                mask = self.compute_similarity_mask(latent_model_input, threshold=0.85)
-                # mask = self.batched_find_idxs_to_keep(latent_model_input, threshold=1, tubelet_size=1, patch_size=1)
+                # breakpoint()
+                # mask = self.compute_similarity_mask(latent_model_input.permute(0, 2, 1, 3, 4), threshold=0.85)
+                # mask = self.compute_similarity_mask(latent_model_input, threshold=0.65)
+                mask = self.batched_find_idxs_to_keep(latent_model_input.permute(0, 2, 1, 3, 4), threshold=0.55, tubelet_size=1, patch_size=1)
                 # mask = self.batched_find_idxs_to_keep(x, threshold=0.3, tubelet_size=1, patch_size=1)
                 print('------------------')
                 total_tokens = mask.numel()
@@ -920,3 +934,43 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
+
+def make_ddim_timesteps(ddim_discr_method, num_ddim_timesteps, num_ddpm_timesteps):
+    if ddim_discr_method == 'uniform':
+        c = num_ddpm_timesteps // num_ddim_timesteps
+        ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
+    elif ddim_discr_method == 'quad':
+        ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .8), num_ddim_timesteps)) ** 2).astype(int)
+    elif ddim_discr_method == 'quad2':
+        ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .999), num_ddim_timesteps)) ** 2).astype(int)
+    elif ddim_discr_method == 'log':
+        # 生成对数空间时间步
+        ddim_timesteps = (np.logspace(0, np.log10(num_ddpm_timesteps), num_ddim_timesteps) - 1).astype(int)
+        ddim_timesteps[-1] = num_ddpm_timesteps - 2
+
+    elif ddim_discr_method == 'exp':
+        ddim_timesteps = (np.exp(np.linspace(0, np.log(num_ddpm_timesteps), num_ddim_timesteps)) - 1).astype(int)
+        
+    
+    else:
+        raise NotImplementedError(f'There is no ddim discretization method called "{ddim_discr_method}"')
+    print(f'Selected timesteps for ddim sampler: {ddim_timesteps}')
+    # assert ddim_timesteps.shape[0] == num_ddim_timesteps
+    # add one to get the final alpha values right (the ones from first scale to data during sampling)
+    ddim_timesteps = interpolate_duplicates(ddim_timesteps)
+    steps_out = ddim_timesteps + 0
+    # if verbose:
+    #     print(f'Selected timesteps for ddim sampler: {steps_out}')
+    return steps_out[::-1].copy()
+
+def interpolate_duplicates(arr):
+    """ 用线性插值替换数组中重复的值，保持时间步的平滑性 """
+    unique, counts = np.unique(arr, return_counts=True)
+    
+    if np.all(counts == 1):  # 没有重复项
+        return arr
+    for i in range(len(arr) - 1):
+        if arr[i] >= arr[i + 1]:
+            arr[i + 1] = arr[i] + 1
+
+    return arr

@@ -1167,6 +1167,8 @@ class OpenSoraPlanPipeline(VideoSysPipeline):
                     callback(step_idx, t, latents)
 
         if not output_type == "latents":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             video = self.decode_latents(latents)
             video = video[:, :num_frames, :height, :width]
         else:
